@@ -4,10 +4,18 @@ A performance-oriented Milestone 1 for deterministic market-data replay. It pars
 CSV events on one thread, transfers normalized events through a bounded SPSC queue,
 and applies them to a fixed-capacity L2/L3 order book on a second thread.
 
-This repository intentionally does **not** include a strategy, risk manager, matching
-engine, FIX session, or exchange router. A generic TLS WebSocket connector is available
-as an optional target; exchange-specific message normalization remains an injected
-callback rather than a core dependency.
+The book supports two modes over one shared data structure (see [ARCHITECTURE.md](ARCHITECTURE.md)):
+
+- **Apply mode** (`process_event`) replays an exchange-decided feed (CSV or NASDAQ
+  ITCH 5.0). It does not match; a crossing book is retained and exposed, because the
+  feed has already been matched by the venue.
+- **Match mode** (`submit`) matches an incoming order against the resting book by
+  price-time priority, emits fills, and rests or kills the remainder per time-in-force.
+
+This repository still does **not** include a strategy, risk manager, FIX session, or
+exchange router. A generic TLS WebSocket connector is available as an optional target;
+exchange-specific message normalization remains an injected callback rather than a core
+dependency.
 
 ## Architecture
 
@@ -77,6 +85,28 @@ sequence,exchange_timestamp_ns,type,order_id,side,price_ticks,quantity
 Cancel events ignore price and quantity. Trade events identify the resting order and
 decrement it by quantity, removing it on an exact fill. An overfill is rejected.
 
+## Matching mode (`submit`)
+
+`submit(OrderRequest, FillSink)` matches an incoming order against the resting book:
+
+- Order types **Limit** and **Market**; time-in-force **GTC**, **IOC**, **FOK**.
+- Matches best-price-first (via the price ladder) and FIFO within a level (price-time
+  priority). Fills are delivered to an allocation-free `FillSink` (function pointer +
+  context); the call is `noexcept` with no hot-path heap allocation.
+- The remainder rests (Limit GTC), is killed (Market / IOC), or the whole order is
+  rejected without side effects (FOK that cannot fully fill). `SubmitResult` encodes both
+  the fill outcome and the remainder disposition.
+
+## NASDAQ ITCH 5.0 feed handler
+
+`itch::ItchFileConnector` implements the same `DataConnector` interface as CSV replay and
+reconstructs the book in apply mode from a 2-byte-length-framed ITCH 5.0 stream. The
+stateless `itch::decode_message` decoder handles the book-affecting subset — Add (`A`/`F`),
+Order Executed (`E`/`C`), Order Cancel (`X`), Order Delete (`D`), Order Replace (`U`) —
+at fixed big-endian offsets with no allocation. Prices are ITCH's 1/10000 integer units
+mapped onto `Price` ticks. Non-book messages are skipped; a malformed or truncated frame
+stops the stream and is reported by `failed()`.
+
 ## Correctness model
 
 - Storage and both hash indexes are allocated in the `OrderBook` constructor.
@@ -94,6 +124,13 @@ decrement it by quantity, removing it on an exact fill. An overfill is rejected.
   It covers a hand-written scenario plus 20,000 seeded pseudo-random events. Every
   256-event batch also compares an order-independent 64-bit state checksum.
 - A concurrent SPSC test checks ordered delivery of 100,000 values.
+- Match mode is checked against an independent price-time reference matcher: a scripted
+  scenario plus 20,000 randomized New/Cancel/Market/IOC/FOK operations compare the full
+  fill stream and the resting book, alongside targeted price-time-priority and TIF tests.
+- The ITCH decoder is checked by a round-trip differential: a minimal encoder emits a
+  framed stream (A/E/C/X/D/U), which is decoded, applied, and compared against the
+  `std::map` reference built from the intended events; malformed/truncated/skipped frames
+  are covered.
 
 The test suite also covers bid/ask ordering, FIFO priority, duplicate IDs, missing
 cancellations, invalid quantities, partial/full trades, pool reuse after exhaustion,
@@ -106,9 +143,12 @@ environment below.
 
 Order-ID and level lookup use fixed-size open addressing: expected constant-time lookup,
 insert, and erase, with linear worst-case probing. Linking or unlinking a known order is
-constant time. `best_bid()`, `best_ask()`, and diagnostic snapshots scan/sort levels and
-are deliberately outside the event-processing hot path; this version therefore does
-not claim that every book operation is O(1).
+constant time. Best price is now **O(1)**: each side maintains a preallocated indexed
+binary heap of active price levels (a "price ladder"; max-heap for bids, min-heap for
+asks), updated in O(log L) only when a level is created or emptied. This is what makes
+`submit()` match through the touch efficiently, and it also makes `best_bid()`/`best_ask()`
+O(1). Full `levels()`/`orders_in_priority()` snapshots still sort and remain diagnostic,
+outside the hot path.
 
 The allocation benchmark replaces scalar, array, and aligned global allocation
 operators and counts calls only around the `process_event()` loop, after book and
@@ -123,6 +163,8 @@ modify workloads generated from ten different seeds. It performs one warm-up and
 measured runs and reports the median. It reports:
 
 - single-thread order-book throughput and measured hot-path allocations;
+- match-mode `submit()` latency and allocations (single-fill marketable IOC);
+- ITCH 5.0 framing+decode latency, throughput, and allocations;
 - standalone CSV field parsing latency;
 - successful queue-call time and total enqueue/backpressure time;
 - queue residence time, order-book processing time, and end-to-end latency;
@@ -175,8 +217,12 @@ residence: order-book p99 stays near 0.17 us while 110% queue-residence p99 reac
 
 ## Current limitations
 
-- The book maintains levels but does not match crossing orders.
+- Apply mode retains crossing orders by design (it replays a matched feed); match mode
+  (`submit`) performs the matching. Self-trade is currently allowed as a documented policy.
 - Capacity is fixed and an exhausted book rejects new orders.
+- The ITCH connector reads the whole framed stream into memory and covers the
+  book-affecting subset (A/F/E/C/X/D/U); MoldUDP64/SoupBinTCP transport, streaming reads,
+  and validation against a real NASDAQ day file remain follow-ups.
 - Best-price queries scan the preallocated level array; a later milestone can add a
   fixed-capacity ordered price index and benchmark the trade-off.
 - Modify priority semantics are documented project semantics, not exchange-specific.
@@ -193,9 +239,10 @@ residence: order-book p99 stays near 0.17 us while 110% queue-residence p99 reac
 ## Repository layout
 
 ```text
-include/market/       public event, connector, queue, and order-book interfaces
-src/                  CSV parser, order book, and two-thread replay executable
-tests/                invariant, differential, parsing, and concurrency tests
-benchmarks/           throughput, latency, and allocation benchmark
+include/market/       public event, order-request, connector, queue, and order-book interfaces
+include/market/itch/  NASDAQ ITCH 5.0 decoder and file/stream connector
+src/                  CSV parser, ITCH connector, order book + matching, replay executable
+tests/                invariant, differential, matching, ITCH round-trip, and concurrency tests
+benchmarks/           order-book, matching, ITCH-decode, parsing, and pipeline benchmarks
 data/                 deterministic sample replay
 ```

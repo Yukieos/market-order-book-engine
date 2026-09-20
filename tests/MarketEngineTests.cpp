@@ -2,6 +2,9 @@
 #include "market/OrderBook.hpp"
 #include "market/SpscQueue.hpp"
 #include "market/StateChecksum.hpp"
+#include "market/itch/ItchFileConnector.hpp"
+
+#include <cstddef>
 
 #include <algorithm>
 #include <atomic>
@@ -122,6 +125,120 @@ private:
     struct RefOrder { Side side; Price price; Quantity quantity; std::uint64_t priority; };
     std::size_t capacity_;
     std::uint64_t next_priority_{0};
+    std::map<OrderId, RefOrder> orders_;
+};
+
+OrderRequest request(RequestType type, OrderId id, Side side, Price price, Quantity quantity,
+                     OrderType order_type = OrderType::Limit,
+                     TimeInForce tif = TimeInForce::GTC) {
+    return {type, id, side, price, quantity, order_type, tif};
+}
+
+// Collects fills from OrderBook::submit through the allocation-free FillSink.
+struct FillCollector {
+    std::vector<Fill> fills;
+    FillSink sink() {
+        return FillSink{this, [](void* ctx, const Fill& f) noexcept {
+                            static_cast<FillCollector*>(ctx)->fills.push_back(f);
+                        }};
+    }
+};
+
+// A deliberately simple price-time matcher used as the differential oracle for
+// OrderBook::submit. O(n) per fill; correctness over speed.
+class ReferenceMatcher {
+public:
+    explicit ReferenceMatcher(std::size_t capacity) : capacity_(capacity) {}
+
+    SubmitResult submit(const OrderRequest& req, std::vector<Fill>& fills) {
+        if (req.type == RequestType::Cancel) {
+            auto it = orders_.find(req.id);
+            if (it == orders_.end()) return SubmitResult::RejectedInvalid;
+            orders_.erase(it);
+            return SubmitResult::Canceled;
+        }
+        if (req.quantity == 0) return SubmitResult::RejectedInvalid;
+        const bool may_rest = req.order_type == OrderType::Limit && req.tif == TimeInForce::GTC;
+        if (may_rest && orders_.find(req.id) != orders_.end()) return SubmitResult::RejectedDuplicate;
+        if (req.tif == TimeInForce::FOK && fillable(req) < req.quantity) return SubmitResult::RejectedFOK;
+
+        Quantity remaining = req.quantity;
+        while (remaining > 0) {
+            auto maker = best_maker(req);
+            if (maker == orders_.end()) break;
+            const Quantity traded = std::min(remaining, maker->second.quantity);
+            fills.push_back(Fill{req.id, maker->first, req.side, maker->second.price, traded,
+                                 fill_sequence_++});
+            remaining -= traded;
+            if (traded == maker->second.quantity) orders_.erase(maker);
+            else maker->second.quantity -= traded;
+        }
+
+        const Quantity filled = req.quantity - remaining;
+        if (remaining == 0) return SubmitResult::FilledComplete;
+        if (may_rest) {
+            if (orders_.size() == capacity_) return SubmitResult::RejectedCapacity;
+            orders_.emplace(req.id, RefOrder{req.side, req.price_ticks, remaining, next_priority_++});
+            return filled == 0 ? SubmitResult::RestedNoFill : SubmitResult::PartialFillRested;
+        }
+        return filled == 0 ? SubmitResult::NoFillKilled : SubmitResult::PartialFillKilled;
+    }
+
+    std::vector<LevelView> levels() const {
+        std::map<std::pair<Side, Price>, LevelView> aggregated;
+        for (const auto& [id, order] : orders_) {
+            (void)id;
+            auto& level = aggregated[{order.side, order.price}];
+            level.side = order.side;
+            level.price_ticks = order.price;
+            level.total_quantity += order.quantity;
+            ++level.order_count;
+        }
+        std::vector<LevelView> result;
+        for (const auto& [key, level] : aggregated) { (void)key; result.push_back(level); }
+        std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+            if (left.side != right.side) return left.side == Side::Buy;
+            return left.side == Side::Buy ? left.price_ticks > right.price_ticks
+                                          : left.price_ticks < right.price_ticks;
+        });
+        return result;
+    }
+
+private:
+    struct RefOrder { Side side; Price price; Quantity quantity; std::uint64_t priority; };
+
+    bool crosses(const OrderRequest& req, Price price) const {
+        if (req.order_type == OrderType::Market) return true;
+        return req.side == Side::Buy ? req.price_ticks >= price : req.price_ticks <= price;
+    }
+
+    Quantity fillable(const OrderRequest& req) const {
+        const Side opposite = req.side == Side::Buy ? Side::Sell : Side::Buy;
+        Quantity available = 0;
+        for (const auto& [id, order] : orders_) {
+            (void)id;
+            if (order.side == opposite && crosses(req, order.price)) available += order.quantity;
+        }
+        return available;
+    }
+
+    std::map<OrderId, RefOrder>::iterator best_maker(const OrderRequest& req) {
+        const Side opposite = req.side == Side::Buy ? Side::Sell : Side::Buy;
+        auto best = orders_.end();
+        for (auto it = orders_.begin(); it != orders_.end(); ++it) {
+            if (it->second.side != opposite || !crosses(req, it->second.price)) continue;
+            if (best == orders_.end()) { best = it; continue; }
+            const bool better_price = req.side == Side::Buy ? it->second.price < best->second.price
+                                                            : it->second.price > best->second.price;
+            const bool same_price = it->second.price == best->second.price;
+            if (better_price || (same_price && it->second.priority < best->second.priority)) best = it;
+        }
+        return best;
+    }
+
+    std::size_t capacity_;
+    std::uint64_t next_priority_{0};
+    std::uint64_t fill_sequence_{0};
     std::map<OrderId, RefOrder> orders_;
 };
 
@@ -257,6 +374,322 @@ void test_spsc_concurrently() {
     CHECK(queue.empty());
 }
 
+void test_matching_limit() {
+    OrderBook book(64);
+    FillCollector fc;
+    CHECK(book.submit(request(RequestType::New, 1, Side::Sell, 102, 5), fc.sink()) == SubmitResult::RestedNoFill);
+    CHECK(book.submit(request(RequestType::New, 2, Side::Sell, 102, 3), fc.sink()) == SubmitResult::RestedNoFill);
+    CHECK(book.submit(request(RequestType::New, 3, Side::Sell, 103, 10), fc.sink()) == SubmitResult::RestedNoFill);
+    CHECK(fc.fills.empty());
+    CHECK(book.best_ask()->price_ticks == 102);
+
+    // Aggressive buy @102 x6 fills id1 fully (5) then id2 partially (1).
+    CHECK(book.submit(request(RequestType::New, 100, Side::Buy, 102, 6), fc.sink()) == SubmitResult::FilledComplete);
+    CHECK(fc.fills.size() == 2);
+    CHECK((fc.fills[0] == Fill{100, 1, Side::Buy, 102, 5, 0}));
+    CHECK((fc.fills[1] == Fill{100, 2, Side::Buy, 102, 1, 1}));
+    CHECK(book.find_order(2)->quantity == 2);
+    CHECK(book.best_ask()->total_quantity == 2);
+
+    // Aggressive buy @103 x4 empties id2 @102 then takes 2 from id3 @103.
+    fc.fills.clear();
+    CHECK(book.submit(request(RequestType::New, 101, Side::Buy, 103, 4), fc.sink()) == SubmitResult::FilledComplete);
+    CHECK(fc.fills.size() == 2);
+    CHECK(fc.fills[0].maker_id == 2 && fc.fills[0].price_ticks == 102 && fc.fills[0].quantity == 2);
+    CHECK(fc.fills[1].maker_id == 3 && fc.fills[1].price_ticks == 103 && fc.fills[1].quantity == 2);
+    CHECK(book.best_ask()->price_ticks == 103);
+    CHECK(book.best_ask()->total_quantity == 8);
+    CHECK(!book.best_bid().has_value());
+}
+
+void test_matching_partial_and_rest() {
+    OrderBook book(64);
+    FillCollector fc;
+    book.submit(request(RequestType::New, 1, Side::Sell, 100, 5), fc.sink());
+    CHECK(book.submit(request(RequestType::New, 2, Side::Buy, 100, 8), fc.sink()) == SubmitResult::PartialFillRested);
+    CHECK(fc.fills.size() == 1);
+    CHECK(fc.fills[0].quantity == 5);
+    CHECK(!book.best_ask().has_value());
+    CHECK(book.best_bid()->price_ticks == 100);
+    CHECK(book.best_bid()->total_quantity == 3);
+    CHECK(book.find_order(2)->quantity == 3);
+}
+
+void test_matching_time_in_force() {
+    {  // Market with partial liquidity: fills, remainder killed (never rests).
+        OrderBook book(64); FillCollector fc;
+        book.submit(request(RequestType::New, 1, Side::Sell, 100, 4), fc.sink());
+        CHECK(book.submit(request(RequestType::New, 2, Side::Buy, 0, 10, OrderType::Market), fc.sink()) == SubmitResult::PartialFillKilled);
+        CHECK(fc.fills.size() == 1 && fc.fills[0].quantity == 4);
+        CHECK(!book.best_ask().has_value() && !book.best_bid().has_value());
+    }
+    {  // Market with no liquidity.
+        OrderBook book(64); FillCollector fc;
+        CHECK(book.submit(request(RequestType::New, 1, Side::Buy, 0, 5, OrderType::Market), fc.sink()) == SubmitResult::NoFillKilled);
+        CHECK(fc.fills.empty());
+    }
+    {  // IOC: fill what crosses, kill the rest.
+        OrderBook book(64); FillCollector fc;
+        book.submit(request(RequestType::New, 1, Side::Sell, 100, 3), fc.sink());
+        CHECK(book.submit(request(RequestType::New, 2, Side::Buy, 100, 5, OrderType::Limit, TimeInForce::IOC), fc.sink()) == SubmitResult::PartialFillKilled);
+        CHECK(fc.fills.size() == 1 && fc.fills[0].quantity == 3);
+        CHECK(!book.best_bid().has_value());
+    }
+    {  // FOK with insufficient liquidity: reject entirely, no state change.
+        OrderBook book(64); FillCollector fc;
+        book.submit(request(RequestType::New, 1, Side::Sell, 100, 3), fc.sink());
+        CHECK(book.submit(request(RequestType::New, 2, Side::Buy, 100, 5, OrderType::Limit, TimeInForce::FOK), fc.sink()) == SubmitResult::RejectedFOK);
+        CHECK(fc.fills.empty());
+        CHECK(book.best_ask()->total_quantity == 3);
+    }
+    {  // FOK with sufficient liquidity across two levels: fully filled.
+        OrderBook book(64); FillCollector fc;
+        book.submit(request(RequestType::New, 1, Side::Sell, 100, 3), fc.sink());
+        book.submit(request(RequestType::New, 2, Side::Sell, 101, 5), fc.sink());
+        CHECK(book.submit(request(RequestType::New, 3, Side::Buy, 101, 5, OrderType::Limit, TimeInForce::FOK), fc.sink()) == SubmitResult::FilledComplete);
+        CHECK(fc.fills.size() == 2);
+        CHECK(fc.fills[0].price_ticks == 100 && fc.fills[0].quantity == 3);
+        CHECK(fc.fills[1].price_ticks == 101 && fc.fills[1].quantity == 2);
+        CHECK(book.best_ask()->price_ticks == 101 && book.best_ask()->total_quantity == 3);
+    }
+}
+
+void test_matching_price_time_priority() {
+    OrderBook book(64);
+    FillCollector fc;
+    book.submit(request(RequestType::New, 1, Side::Buy, 100, 5), fc.sink());  // older @100
+    book.submit(request(RequestType::New, 2, Side::Buy, 100, 5), fc.sink());  // newer @100
+    book.submit(request(RequestType::New, 3, Side::Buy, 101, 4), fc.sink());  // better price
+    // Sell x6: must take the better price (id3 @101) first, then the oldest @100 (id1).
+    CHECK(book.submit(request(RequestType::New, 100, Side::Sell, 100, 6), fc.sink()) == SubmitResult::FilledComplete);
+    CHECK(fc.fills.size() == 2);
+    CHECK(fc.fills[0].maker_id == 3 && fc.fills[0].price_ticks == 101 && fc.fills[0].quantity == 4);
+    CHECK(fc.fills[1].maker_id == 1 && fc.fills[1].price_ticks == 100 && fc.fills[1].quantity == 2);
+    CHECK(book.find_order(1)->quantity == 3);
+    CHECK(book.find_order(2)->quantity == 5);
+}
+
+void test_matching_randomized_differential() {
+    constexpr std::size_t capacity = 512;  // >> working set so capacity never diverges
+    OrderBook book(capacity);
+    ReferenceMatcher reference(capacity);
+    std::vector<Fill> book_fills;
+    std::vector<Fill> ref_fills;
+    FillSink sink{&book_fills, [](void* ctx, const Fill& f) noexcept {
+                      static_cast<std::vector<Fill>*>(ctx)->push_back(f);
+                  }};
+    std::mt19937_64 random(0x00C0FFEEULL);
+    for (std::uint64_t n = 1; n <= 20'000; ++n) {
+        const auto side = random() % 2 == 0 ? Side::Buy : Side::Sell;
+        if (random() % 5 == 0) {
+            const auto cid = static_cast<OrderId>(1 + random() % 200);
+            const auto rq = request(RequestType::Cancel, cid, side, 0, 0);
+            CHECK(book.submit(rq, sink) == reference.submit(rq, ref_fills));
+        } else {
+            const auto id = static_cast<OrderId>(1 + random() % 200);
+            const auto price = static_cast<Price>(9'995 + random() % 11);
+            const auto quantity = static_cast<Quantity>(1 + random() % 10);
+            const auto order_type = random() % 8 == 0 ? OrderType::Market : OrderType::Limit;
+            const auto roll = random() % 10;
+            const auto tif = roll < 7 ? TimeInForce::GTC
+                                      : (roll < 9 ? TimeInForce::IOC : TimeInForce::FOK);
+            const auto rq = request(RequestType::New, id, side, price, quantity, order_type, tif);
+            CHECK(book.submit(rq, sink) == reference.submit(rq, ref_fills));
+        }
+        if (n % 512 == 0) CHECK(book.levels() == reference.levels());
+    }
+    CHECK(book_fills == ref_fills);
+    CHECK(book.levels() == reference.levels());
+}
+
+void test_reduce_and_replace() {
+    auto replace_event = event(EventType::Replace, 2, Side::Buy, 99, 8);
+    replace_event.new_order_id = 3;
+    const std::vector<MarketDataEvent> events{
+        event(EventType::Add, 1, Side::Buy, 100, 10),
+        event(EventType::Add, 2, Side::Buy, 100, 5),
+        event(EventType::Reduce, 1, Side::Buy, 100, 4),  // id1 -> qty 6
+        replace_event,                                    // id2 -> id3 @99 qty8, side inherited
+    };
+    OrderBook optimized(16);
+    ReferenceBook reference(16);
+    for (const auto& input : events) {
+        CHECK(optimized.process_event(input) == reference.process(input));
+        CHECK(optimized.orders_in_priority() == reference.orders());
+        CHECK(optimized.levels() == reference.levels());
+    }
+    CHECK(optimized.find_order(1)->quantity == 6);
+    CHECK(!optimized.find_order(2).has_value());
+    CHECK(optimized.find_order(3)->quantity == 8);
+    CHECK(optimized.find_order(3)->side == Side::Buy);
+    // Replace of a missing order and duplicate new id are rejected.
+    auto missing = event(EventType::Replace, 999, Side::Buy, 99, 1);
+    missing.new_order_id = 500;
+    CHECK(optimized.process_event(missing) == ProcessResult::OrderNotFound);
+    auto dup = event(EventType::Replace, 1, Side::Buy, 99, 1);
+    dup.new_order_id = 3;  // 3 already exists
+    CHECK(optimized.process_event(dup) == ProcessResult::DuplicateOrderId);
+}
+
+// --- ITCH 5.0 round-trip helpers (a minimal big-endian encoder for tests) ---
+
+void put_be(std::vector<std::byte>& out, std::uint64_t value, int bytes) {
+    for (int i = bytes - 1; i >= 0; --i) {
+        out.push_back(static_cast<std::byte>((value >> (8 * i)) & 0xFFULL));
+    }
+}
+
+// Encode one book-affecting event as a 2-byte-length-framed ITCH 5.0 message.
+// Trade encodes as 'C' (executed with price) when price is set, else 'E'.
+void itch_encode(std::vector<std::byte>& out, const MarketDataEvent& e) {
+    std::vector<std::byte> msg;
+    const auto header = [&](char type) {
+        msg.push_back(static_cast<std::byte>(type));
+        put_be(msg, 0, 2);                        // stock_locate
+        put_be(msg, 0, 2);                        // tracking_number
+        put_be(msg, e.exchange_timestamp_ns, 6);  // timestamp
+    };
+    const auto side_byte = e.side == Side::Buy ? std::byte{'B'} : std::byte{'S'};
+    switch (e.type) {
+        case EventType::Add:
+            header('A');
+            put_be(msg, e.order_id, 8);
+            msg.push_back(side_byte);
+            put_be(msg, e.quantity, 4);
+            for (int i = 0; i < 8; ++i) msg.push_back(std::byte{' '});  // stock
+            put_be(msg, static_cast<std::uint64_t>(e.price_ticks), 4);
+            break;
+        case EventType::Trade:
+            if (e.price_ticks != 0) {
+                header('C');
+                put_be(msg, e.order_id, 8);
+                put_be(msg, e.quantity, 4);   // executed shares
+                put_be(msg, 0, 8);            // match number
+                msg.push_back(std::byte{'Y'});// printable
+                put_be(msg, static_cast<std::uint64_t>(e.price_ticks), 4);
+            } else {
+                header('E');
+                put_be(msg, e.order_id, 8);
+                put_be(msg, e.quantity, 4);   // executed shares
+                put_be(msg, 0, 8);            // match number
+            }
+            break;
+        case EventType::Reduce:
+            header('X');
+            put_be(msg, e.order_id, 8);
+            put_be(msg, e.quantity, 4);       // canceled shares
+            break;
+        case EventType::Cancel:
+            header('D');
+            put_be(msg, e.order_id, 8);
+            break;
+        case EventType::Replace:
+            header('U');
+            put_be(msg, e.order_id, 8);       // original reference
+            put_be(msg, e.new_order_id, 8);   // new reference
+            put_be(msg, e.quantity, 4);
+            put_be(msg, static_cast<std::uint64_t>(e.price_ticks), 4);
+            break;
+        case EventType::Modify:
+            break;  // not an ITCH message
+    }
+    put_be(out, static_cast<std::uint64_t>(msg.size()), 2);
+    out.insert(out.end(), msg.begin(), msg.end());
+}
+
+void test_itch_round_trip() {
+    auto replace_event = event(EventType::Replace, 1, Side::Buy, 999, 40);
+    replace_event.new_order_id = 4;
+    const std::vector<MarketDataEvent> script{
+        event(EventType::Add, 1, Side::Buy, 1000, 100),
+        event(EventType::Add, 2, Side::Buy, 1000, 50),
+        event(EventType::Add, 3, Side::Sell, 1020, 80),
+        event(EventType::Trade, 1, Side::Buy, 0, 30),      // 'E' partial execution
+        event(EventType::Trade, 3, Side::Sell, 1020, 20),  // 'C' execution with price
+        event(EventType::Reduce, 2, Side::Buy, 0, 10),     // 'X' partial cancel
+        replace_event,                                      // 'U' replace 1 -> 4
+        event(EventType::Cancel, 4),                        // 'D' delete
+        event(EventType::Trade, 2, Side::Buy, 0, 40),      // 'E' full fill removes order 2
+    };
+
+    std::vector<std::byte> bytes;
+    for (const auto& e : script) itch_encode(bytes, e);
+
+    itch::ItchFileConnector connector(std::move(bytes));
+    OrderBook book(64);
+    ReferenceBook reference(64);
+    MarketDataEvent decoded{};
+    std::size_t index = 0;
+    while (connector.next(decoded)) {
+        CHECK(index < script.size());
+        const auto& expected = script[index];
+        CHECK(decoded.type == expected.type);
+        CHECK(decoded.order_id == expected.order_id);
+        if (expected.type == EventType::Add) {
+            CHECK(decoded.side == expected.side);
+            CHECK(decoded.price_ticks == expected.price_ticks);
+            CHECK(decoded.quantity == expected.quantity);
+        }
+        if (expected.type == EventType::Replace) {
+            CHECK(decoded.new_order_id == expected.new_order_id);
+            CHECK(decoded.price_ticks == expected.price_ticks);
+            CHECK(decoded.quantity == expected.quantity);
+        }
+        // Reconstruct from the decoded stream; oracle applies the intended script.
+        book.process_event(decoded);
+        reference.process(expected);
+        CHECK(book.orders_in_priority() == reference.orders());
+        CHECK(book.levels() == reference.levels());
+        ++index;
+    }
+    CHECK(!connector.failed());
+    CHECK(index == script.size());
+    CHECK(connector.messages_decoded() == script.size());
+    CHECK(book.state_checksum() == reference.state_checksum());
+    // End state: only order 3 remains, sell @1020 with 60 left.
+    CHECK(book.best_ask()->price_ticks == 1020);
+    CHECK(book.best_ask()->total_quantity == 60);
+    CHECK(!book.best_bid().has_value());
+}
+
+void test_itch_malformed_and_skipped() {
+    {  // Truncated: frame claims 36 bytes but only 1 is present.
+        std::vector<std::byte> bytes;
+        put_be(bytes, 36, 2);
+        bytes.push_back(std::byte{'A'});
+        itch::ItchFileConnector connector(std::move(bytes));
+        MarketDataEvent e{};
+        CHECK(!connector.next(e));
+        CHECK(connector.failed());
+    }
+    {  // Zero-length frame is malformed.
+        std::vector<std::byte> bytes;
+        put_be(bytes, 0, 2);
+        itch::ItchFileConnector connector(std::move(bytes));
+        MarketDataEvent e{};
+        CHECK(!connector.next(e));
+        CHECK(connector.failed());
+    }
+    {  // A non-book message ('S' system event) is skipped, then a valid Add is returned.
+        std::vector<std::byte> bytes;
+        std::vector<std::byte> system_message;
+        system_message.push_back(std::byte{'S'});
+        for (int i = 0; i < 11; ++i) system_message.push_back(std::byte{0});
+        put_be(bytes, static_cast<std::uint64_t>(system_message.size()), 2);
+        bytes.insert(bytes.end(), system_message.begin(), system_message.end());
+        itch_encode(bytes, event(EventType::Add, 7, Side::Sell, 500, 3));
+
+        itch::ItchFileConnector connector(std::move(bytes));
+        MarketDataEvent e{};
+        CHECK(connector.next(e));
+        CHECK(!connector.failed());
+        CHECK(e.type == EventType::Add && e.order_id == 7 && e.side == Side::Sell);
+        CHECK(e.price_ticks == 500 && e.quantity == 3);
+        CHECK(!connector.next(e));
+        CHECK(!connector.failed());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -268,6 +701,14 @@ int main() {
         test_randomized_differential();
         test_crossed_book_is_retained();
         test_checksum_observes_state_changes();
+        test_matching_limit();
+        test_matching_partial_and_rest();
+        test_matching_time_in_force();
+        test_matching_price_time_priority();
+        test_matching_randomized_differential();
+        test_reduce_and_replace();
+        test_itch_round_trip();
+        test_itch_malformed_and_skipped();
         test_spsc_concurrently();
         std::cout << "all tests passed\n";
     } catch (const std::exception& error) {

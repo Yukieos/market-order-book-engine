@@ -11,6 +11,7 @@ find_package(Threads REQUIRED)
 
 add_library(market_engine
     src/CSVReplayConnector.cpp
+    src/ItchFileConnector.cpp
     src/OrderBook.cpp
 )
 target_include_directories(market_engine PUBLIC include)

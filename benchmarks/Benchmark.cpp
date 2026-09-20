@@ -2,12 +2,14 @@
 #include "market/OrderBook.hpp"
 #include "market/SpscQueue.hpp"
 #include "market/StateChecksum.hpp"
+#include "market/itch/ItchFileConnector.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <charconv>
+#include <cstddef>
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
@@ -431,6 +433,176 @@ void benchmark_load_levels(std::size_t count) {
     }
 }
 
+// --- M2: matching-engine latency (single-fill marketable IOC against one deep maker) ---
+
+struct MatchRun {
+    double events_per_second{};
+    Distribution latency;
+    std::uint64_t allocations{};
+    std::uint64_t fills{};
+};
+
+MatchRun run_matching(std::size_t count) {
+    OrderBook book(active_orders * 2);
+    std::uint64_t fills = 0;
+    const FillSink sink{&fills, [](void* ctx, const Fill&) noexcept {
+                            ++*static_cast<std::uint64_t*>(ctx);
+                        }};
+    // One resting maker deep enough that no taker ever fully consumes it: each IOC
+    // taker crosses for a single partial fill, isolating the matching hot path.
+    const OrderRequest maker{RequestType::New, 1, Side::Sell, 1000,
+                             static_cast<Quantity>(count) + 16, OrderType::Limit, TimeInForce::GTC};
+    if (book.submit(maker, sink) != SubmitResult::RestedNoFill) throw std::runtime_error("maker failed");
+
+    std::vector<std::uint64_t> latency(count);
+    OrderRequest taker{RequestType::New, 0, Side::Buy, 1000, 1, OrderType::Limit, TimeInForce::IOC};
+    allocation_counter::calls.store(0, std::memory_order_relaxed);
+    allocation_counter::enabled.store(true, std::memory_order_release);
+    const auto start = Clock::now();
+    for (std::size_t i = 0; i < count; ++i) {
+        taker.id = i + 2;
+        const auto begin = now_ns();
+        if (book.submit(taker, sink) != SubmitResult::FilledComplete) throw std::runtime_error("taker not filled");
+        const auto end = now_ns();
+        latency[i] = end - begin;
+    }
+    const auto stop = Clock::now();
+    allocation_counter::enabled.store(false, std::memory_order_release);
+    const auto seconds = std::chrono::duration<double>(stop - start).count();
+    return {static_cast<double>(count) / seconds, summarize(latency),
+            allocation_counter::calls.load(), fills};
+}
+
+void benchmark_matching(std::size_t count) {
+    (void)run_matching(std::min<std::size_t>(count, 20'000));
+    std::vector<double> throughput;
+    std::vector<std::uint64_t> p50, p95, p99, maximum;
+    std::uint64_t allocations = 0;
+    for (std::size_t run = 0; run < measured_runs; ++run) {
+        const auto result = run_matching(count);
+        throughput.push_back(result.events_per_second);
+        p50.push_back(result.latency.p50);
+        p95.push_back(result.latency.p95);
+        p99.push_back(result.latency.p99);
+        maximum.push_back(result.latency.maximum);
+        allocations = std::max(allocations, result.allocations);
+    }
+    std::cout << "section=matching runs=" << measured_runs << " orders_per_run=" << count
+              << " median_matches_per_second=" << static_cast<std::uint64_t>(median(throughput))
+              << " max_measured_heap_allocations=" << allocations;
+    print_distribution("submit", {median(p50), median(p95), median(p99), median(maximum)});
+    std::cout << " note=\"single-fill marketable IOC\"\n";
+}
+
+// --- M3: ITCH 5.0 decode latency (framing + decode via the feed handler) ---
+
+void append_be(std::vector<std::byte>& out, std::uint64_t value, int bytes) {
+    for (int i = bytes - 1; i >= 0; --i) {
+        out.push_back(static_cast<std::byte>((value >> (8 * i)) & 0xFFULL));
+    }
+}
+
+std::vector<std::byte> make_itch_stream(std::size_t count, std::uint64_t seed) {
+    std::mt19937_64 random(seed);
+    std::vector<std::byte> out;
+    out.reserve(count * 32);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto id = static_cast<std::uint64_t>((random() % active_orders) + 1);
+        std::vector<std::byte> msg;
+        const auto header = [&](char type) {
+            msg.push_back(static_cast<std::byte>(type));
+            append_be(msg, 0, 2);
+            append_be(msg, 0, 2);
+            append_be(msg, i * 100, 6);
+        };
+        switch (random() % 4) {
+            case 0:  // Add
+                header('A');
+                append_be(msg, id, 8);
+                msg.push_back(random() % 2 == 0 ? std::byte{'B'} : std::byte{'S'});
+                append_be(msg, 1 + random() % 100, 4);
+                for (int b = 0; b < 8; ++b) msg.push_back(std::byte{' '});
+                append_be(msg, 9'936 + random() % 128, 4);
+                break;
+            case 1:  // Order Executed
+                header('E');
+                append_be(msg, id, 8);
+                append_be(msg, 1 + random() % 50, 4);
+                append_be(msg, 0, 8);
+                break;
+            case 2:  // Order Cancel (partial)
+                header('X');
+                append_be(msg, id, 8);
+                append_be(msg, 1 + random() % 50, 4);
+                break;
+            default:  // Order Delete
+                header('D');
+                append_be(msg, id, 8);
+                break;
+        }
+        append_be(out, static_cast<std::uint64_t>(msg.size()), 2);
+        out.insert(out.end(), msg.begin(), msg.end());
+    }
+    return out;
+}
+
+struct ItchRun {
+    double messages_per_second{};
+    Distribution latency;
+    std::uint64_t allocations{};
+    std::uint64_t decoded{};
+};
+
+ItchRun run_itch_decode(const std::vector<std::byte>& bytes) {
+    std::vector<std::byte> buffer(bytes);  // owned copy; next() is allocation-free
+    itch::ItchFileConnector connector(std::move(buffer));
+    std::vector<std::uint64_t> latency;
+    latency.reserve(bytes.size() / 16);
+    MarketDataEvent event{};
+    std::uint64_t decoded = 0;
+    allocation_counter::calls.store(0, std::memory_order_relaxed);
+    allocation_counter::enabled.store(true, std::memory_order_release);
+    const auto start = Clock::now();
+    for (;;) {
+        const auto begin = now_ns();
+        const bool ok = connector.next(event);
+        const auto end = now_ns();
+        if (!ok) break;
+        latency.push_back(end - begin);
+        ++decoded;
+    }
+    const auto stop = Clock::now();
+    allocation_counter::enabled.store(false, std::memory_order_release);
+    if (connector.failed()) throw std::runtime_error("itch decode failed");
+    const auto seconds = std::chrono::duration<double>(stop - start).count();
+    return {static_cast<double>(decoded) / seconds, summarize(latency),
+            allocation_counter::calls.load(), decoded};
+}
+
+void benchmark_itch_decode(std::size_t count) {
+    (void)run_itch_decode(make_itch_stream(std::min<std::size_t>(count, 20'000), base_seed - 3));
+    std::vector<double> throughput;
+    std::vector<std::uint64_t> p50, p95, p99, maximum;
+    std::uint64_t allocations = 0;
+    std::uint64_t decoded = 0;
+    for (std::size_t run = 0; run < measured_runs; ++run) {
+        const auto result = run_itch_decode(make_itch_stream(count, base_seed + run));
+        throughput.push_back(result.messages_per_second);
+        p50.push_back(result.latency.p50);
+        p95.push_back(result.latency.p95);
+        p99.push_back(result.latency.p99);
+        maximum.push_back(result.latency.maximum);
+        allocations = std::max(allocations, result.allocations);
+        decoded = result.decoded;
+    }
+    std::cout << "section=itch_decode runs=" << measured_runs << " messages_per_run=" << count
+              << " decoded_events_per_run=" << decoded
+              << " median_messages_per_second=" << static_cast<std::uint64_t>(median(throughput))
+              << " max_measured_heap_allocations=" << allocations;
+    print_distribution("decode", {median(p50), median(p95), median(p99), median(maximum)});
+    std::cout << '\n';
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -442,7 +614,9 @@ int main(int argc, char** argv) {
         std::cout << "benchmark_flags=\"" << MARKET_BENCHMARK_FLAGS << "\" events=" << count
                   << " measured_runs=" << measured_runs << " warmup_runs=1 seeds=" << measured_runs << '\n';
         benchmark_hot_path(count);
+        benchmark_matching(count);
         benchmark_parsing(count);
+        benchmark_itch_decode(count);
         benchmark_load_levels(count);
     } catch (const std::exception& error) {
         allocation_counter::enabled.store(false, std::memory_order_relaxed);
