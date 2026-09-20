@@ -40,8 +40,9 @@ LengthPrefixedDatagramFileSource::next_datagram() {
 
 // --- MoldUdp64Connector ---
 
-MoldUdp64Connector::MoldUdp64Connector(std::unique_ptr<DatagramSource> source) noexcept
-    : source_(std::move(source)) {}
+MoldUdp64Connector::MoldUdp64Connector(std::unique_ptr<DatagramSource> source,
+                                       RetransmitSource* retransmit) noexcept
+    : source_(std::move(source)), retransmit_(retransmit) {}
 
 bool MoldUdp64Connector::load_next_packet() {
     for (;;) {
@@ -70,9 +71,15 @@ bool MoldUdp64Connector::load_next_packet() {
             expected_ = seq;
         }
         if (seq > expected_) {  // gap: sequence numbers were skipped
-            messages_missed_ += seq - expected_;
             ++gaps_detected_;
-            expected_ = seq;
+            if (retransmit_ != nullptr) {  // recover [expected_, seq) before this packet
+                recover_next_ = expected_;
+                recover_end_ = seq;
+                recovering_ = true;
+            } else {
+                messages_missed_ += seq - expected_;
+                expected_ = seq;
+            }
         } else if (seq < expected_) {  // overlap: skip messages already delivered
             std::uint64_t already_seen = expected_ - seq;
             while (already_seen > 0 && local_index_ < packet_.message_count()) {
@@ -93,9 +100,35 @@ bool MoldUdp64Connector::load_next_packet() {
 
 bool MoldUdp64Connector::next(MarketDataEvent& event) {
     for (;;) {
+        // Drain any in-progress gap recovery before returning to the live packet.
+        if (recovering_) {
+            if (recover_next_ < recover_end_) {
+                const std::uint64_t sequence = recover_next_++;
+                const auto payload = retransmit_->recover(sequence);
+                if (!payload) {
+                    ++messages_missed_;  // could not be recovered
+                    continue;
+                }
+                const DecodeResult result = decode_message(payload->data(), payload->size());
+                if (result.status == DecodeStatus::Malformed) {
+                    failed_ = true;
+                    return false;
+                }
+                if (result.status == DecodeStatus::Event) {
+                    event = result.event;
+                    event.sequence = sequence;
+                    last_sequence_ = sequence;
+                    ++messages_decoded_;
+                    return true;
+                }
+                continue;  // recovered a non-book message; keep draining
+            }
+            recovering_ = false;
+        }
         if (!have_packet_ || local_index_ >= packet_.message_count()) {
             have_packet_ = false;
             if (!load_next_packet()) return false;
+            continue;  // a gap may have started recovery; re-check at the loop top
         }
         std::span<const std::byte> payload;
         if (!packet_.read_block(offset_, payload)) {

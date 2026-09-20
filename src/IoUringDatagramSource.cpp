@@ -34,6 +34,8 @@ IoUringDatagramSource::IoUringDatagramSource(const std::string& bind_addr, std::
 
     int reuse = 1;
     ::setsockopt(impl_->fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    int rcvbuf = 4 << 20;  // request 4 MiB so short bursts are not dropped (kernel may cap)
+    ::setsockopt(impl_->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;

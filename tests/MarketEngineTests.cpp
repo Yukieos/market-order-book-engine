@@ -6,6 +6,7 @@
 #include "market/Time.hpp"
 #include "market/itch/ItchFileConnector.hpp"
 #include "market/itch/MoldUdp64Connector.hpp"
+#include "market/itch/SoupBinTcpConnector.hpp"
 
 #include <cstddef>
 #include <fstream>
@@ -713,6 +714,29 @@ std::unique_ptr<itch::DatagramSource> in_memory(std::vector<std::vector<std::byt
     return std::make_unique<itch::InMemoryDatagramSource>(std::move(datagrams));
 }
 
+// The raw ITCH message for one event (itch_encode output with the 2-byte frame removed).
+std::vector<std::byte> itch_message_only(const MarketDataEvent& e) {
+    std::vector<std::byte> framed;
+    itch_encode(framed, e);
+    return std::vector<std::byte>(framed.begin() + 2, framed.end());
+}
+
+// A retransmit server backed by an in-memory map of sequence -> raw ITCH message.
+class InMemoryRetransmit final : public itch::RetransmitSource {
+public:
+    void add(std::uint64_t sequence, std::vector<std::byte> message) {
+        store_[sequence] = std::move(message);
+    }
+    std::optional<std::span<const std::byte>> recover(std::uint64_t sequence) override {
+        const auto it = store_.find(sequence);
+        if (it == store_.end()) return std::nullopt;
+        return std::span<const std::byte>(it->second);
+    }
+
+private:
+    std::map<std::uint64_t, std::vector<std::byte>> store_;
+};
+
 void test_mold_udp64_basic() {
     const std::vector<MarketDataEvent> first{
         event(EventType::Add, 10, Side::Buy, 1000, 100),
@@ -776,6 +800,58 @@ void test_mold_udp64_overlap() {
     CHECK(connector.messages_missed() == 0);
 }
 
+void test_mold_udp64_retransmit_recovery() {
+    const std::vector<MarketDataEvent> all{
+        event(EventType::Add, 1, Side::Buy, 100, 10),
+        event(EventType::Add, 2, Side::Buy, 100, 10),
+        event(EventType::Add, 3, Side::Buy, 100, 10),  // "lost", but recoverable
+        event(EventType::Add, 4, Side::Buy, 100, 10),
+        event(EventType::Add, 5, Side::Buy, 100, 10),
+    };
+    std::vector<std::vector<std::byte>> datagrams{
+        mold_packet(1, {all[0], all[1]}),   // sequences 1,2
+        mold_packet(4, {all[3], all[4]}),   // sequences 4,5 -> gap at 3
+    };
+    auto retransmit = std::make_unique<InMemoryRetransmit>();
+    retransmit->add(3, itch_message_only(all[2]));
+
+    itch::MoldUdp64Connector connector(in_memory(std::move(datagrams)), retransmit.get());
+    std::vector<OrderId> ids;
+    MarketDataEvent decoded{};
+    while (connector.next(decoded)) ids.push_back(decoded.order_id);
+
+    CHECK(ids.size() == 5);
+    for (std::size_t i = 0; i < 5; ++i) CHECK(ids[i] == static_cast<OrderId>(i + 1));
+    CHECK(connector.gaps_detected() == 1);
+    CHECK(connector.messages_missed() == 0);  // fully recovered, gap-free delivery
+}
+
+void test_mold_udp64_retransmit_partial() {
+    const std::vector<MarketDataEvent> all{
+        event(EventType::Add, 1, Side::Buy, 100, 10),
+        event(EventType::Add, 2, Side::Buy, 100, 10),
+        event(EventType::Add, 3, Side::Buy, 100, 10),
+        event(EventType::Add, 4, Side::Buy, 100, 10),
+        event(EventType::Add, 5, Side::Buy, 100, 10),
+    };
+    std::vector<std::vector<std::byte>> datagrams{
+        mold_packet(1, {all[0], all[1]}),   // 1,2
+        mold_packet(5, {all[4]}),           // 5 -> gap at 3,4
+    };
+    auto retransmit = std::make_unique<InMemoryRetransmit>();
+    retransmit->add(3, itch_message_only(all[2]));  // seq 4 is unrecoverable
+
+    itch::MoldUdp64Connector connector(in_memory(std::move(datagrams)), retransmit.get());
+    std::vector<OrderId> ids;
+    MarketDataEvent decoded{};
+    while (connector.next(decoded)) ids.push_back(decoded.order_id);
+
+    CHECK(ids.size() == 4);  // 1, 2, 3 (recovered), 5
+    CHECK(ids[0] == 1 && ids[1] == 2 && ids[2] == 3 && ids[3] == 5);
+    CHECK(connector.gaps_detected() == 1);
+    CHECK(connector.messages_missed() == 1);  // seq 4 could not be recovered
+}
+
 // --- M3 follow-up: streaming file connector matches the in-memory framer ---
 
 void test_itch_streaming_file_equivalence() {
@@ -810,6 +886,60 @@ void test_itch_streaming_file_equivalence() {
     CHECK(!streamed.failed() && !in_memory_conn.failed());
     CHECK(count == script.size());
     std::filesystem::remove(path);
+}
+
+// --- M3 follow-up: SoupBinTCP framing ---
+
+void soup_packet(std::vector<std::byte>& out, char type, const std::vector<std::byte>& payload) {
+    put_be(out, static_cast<std::uint64_t>(payload.size() + 1), 2);  // length = type + payload
+    out.push_back(static_cast<std::byte>(type));
+    out.insert(out.end(), payload.begin(), payload.end());
+}
+
+void test_soupbintcp() {
+    auto trade_with_price = event(EventType::Trade, 1, Side::Buy, 100, 4);  // encodes as 'C'
+    const std::vector<MarketDataEvent> script{
+        event(EventType::Add, 1, Side::Buy, 100, 10),
+        event(EventType::Add, 2, Side::Buy, 100, 5),
+        event(EventType::Add, 3, Side::Sell, 105, 8),
+        trade_with_price,
+        event(EventType::Cancel, 2),
+    };
+    std::vector<std::byte> bytes;
+    soup_packet(bytes, 'H', {});                                    // server heartbeat: skipped
+    for (const auto& e : script) soup_packet(bytes, 'S', itch_message_only(e));
+    soup_packet(bytes, 'H', {});                                    // another heartbeat
+    soup_packet(bytes, 'Z', {});                                    // end of session
+
+    itch::SoupBinTcpConnector connector(std::move(bytes));
+    OrderBook book(64);
+    ReferenceBook reference(64);
+    MarketDataEvent decoded{};
+    std::size_t index = 0;
+    std::uint64_t last_seq = 0;
+    while (connector.next(decoded)) {
+        CHECK(index < script.size());
+        book.process_event(decoded);
+        reference.process(script[index]);
+        CHECK(book.levels() == reference.levels());
+        last_seq = decoded.sequence;
+        ++index;
+    }
+    CHECK(!connector.failed());
+    CHECK(connector.end_of_session());
+    CHECK(index == script.size());
+    CHECK(connector.messages_decoded() == script.size());
+    CHECK(last_seq == script.size());  // sequenced packets advance 1..N
+    CHECK(book.state_checksum() == reference.state_checksum());
+}
+
+void test_soupbintcp_malformed() {
+    std::vector<std::byte> bytes;
+    put_be(bytes, 0, 2);  // zero-length packet: no room for a type byte
+    itch::SoupBinTcpConnector connector(std::move(bytes));
+    MarketDataEvent e{};
+    CHECK(!connector.next(e));
+    CHECK(connector.failed());
 }
 
 // --- M4: hardware cycle timing and thread affinity ---
@@ -853,7 +983,11 @@ int main() {
         test_mold_udp64_basic();
         test_mold_udp64_gap();
         test_mold_udp64_overlap();
+        test_mold_udp64_retransmit_recovery();
+        test_mold_udp64_retransmit_partial();
         test_itch_streaming_file_equivalence();
+        test_soupbintcp();
+        test_soupbintcp_malformed();
         test_hardware_timing();
         test_affinity_api();
         test_spsc_concurrently();

@@ -6,8 +6,23 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <span>
 
 namespace market::itch {
+
+// Supplies the raw ITCH message payload for a missing sequence number, modelling a
+// MoldUDP64 rewind/retransmission server. On a detected gap the connector requests
+// each missing sequence in order and splices recovered messages into the delivered
+// stream, so downstream sees a gap-free feed. A real deployment would back this with
+// a UDP request/response channel to the exchange's retransmit host.
+class RetransmitSource {
+public:
+    virtual ~RetransmitSource() = default;
+    // Returns the payload for `sequence` (valid until the next call), or nullopt if it
+    // cannot be recovered (then the connector counts it as genuinely missed).
+    virtual std::optional<std::span<const std::byte>> recover(std::uint64_t sequence) = 0;
+};
 
 // Decodes a MoldUDP64 stream (pulled datagram-by-datagram from a DatagramSource)
 // into MarketDataEvents for apply mode, reusing itch::decode_message. Tracks the
@@ -15,7 +30,10 @@ namespace market::itch {
 // messages) and overlaps (retransmits, whose already-seen messages are skipped).
 class MoldUdp64Connector final : public DataConnector {
 public:
-    explicit MoldUdp64Connector(std::unique_ptr<DatagramSource> source) noexcept;
+    // `retransmit` is optional: when supplied, detected gaps are recovered from it
+    // and spliced into the delivered stream; when null, gaps are only counted.
+    explicit MoldUdp64Connector(std::unique_ptr<DatagramSource> source,
+                                RetransmitSource* retransmit = nullptr) noexcept;
 
     bool next(MarketDataEvent& event) override;
 
@@ -30,6 +48,7 @@ private:
     bool load_next_packet();
 
     std::unique_ptr<DatagramSource> source_;
+    RetransmitSource* retransmit_{nullptr};
     MoldUdp64Packet packet_{};
     std::size_t offset_{0};
     std::uint16_t local_index_{0};
@@ -37,6 +56,9 @@ private:
     bool initialized_{false};
     bool failed_{false};
     bool end_of_session_{false};
+    bool recovering_{false};
+    std::uint64_t recover_next_{0};
+    std::uint64_t recover_end_{0};
     std::uint64_t expected_{0};
     std::uint64_t last_sequence_{0};
     std::uint64_t gaps_detected_{0};

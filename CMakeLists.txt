@@ -16,6 +16,7 @@ add_library(market_engine
     src/ItchFileConnector.cpp
     src/MoldUdp64Connector.cpp
     src/OrderBook.cpp
+    src/SoupBinTcpConnector.cpp
 )
 target_include_directories(market_engine PUBLIC include)
 target_link_libraries(market_engine PUBLIC Threads::Threads)
@@ -51,6 +52,12 @@ if(MARKET_ENABLE_IO_URING)
     )
     target_compile_definitions(market_io_uring PUBLIC MARKET_HAVE_IO_URING=1)
     target_compile_options(market_io_uring PRIVATE
+        $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall -Wextra -Wpedantic -Wconversion>
+    )
+
+    add_executable(io_uring_pipeline_bench benchmarks/IoUringPipelineBench.cpp)
+    target_link_libraries(io_uring_pipeline_bench PRIVATE market_io_uring Threads::Threads)
+    target_compile_options(io_uring_pipeline_bench PRIVATE
         $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall -Wextra -Wpedantic -Wconversion>
     )
 endif()

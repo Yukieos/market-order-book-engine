@@ -114,7 +114,14 @@ socket below) yields one packet at a time, and the connector unpacks the 20-byte
 and length-framed blocks through the same `decode_message`. Because each packet carries
 the sequence of its first message, the connector tracks the expected sequence and reports
 **gaps** (`gaps_detected()` / `messages_missed()`) and skips **overlaps** (retransmits);
-heartbeats and end-of-session are handled.
+heartbeats and end-of-session are handled. An optional `RetransmitSource` performs
+**gap recovery**: missing sequences are requested and spliced back into the delivered
+stream in order (modelling a rewind/retransmit server), leaving downstream gap-free.
+
+**SoupBinTCP.** `itch::SoupBinTcpConnector` frames NASDAQ's TCP session layer and decodes
+the ITCH payload of each Sequenced Data packet, skipping heartbeat/login/debug packets and
+stopping on End of Session. It covers the framing/decoding core (not the live TCP login
+handshake).
 
 **Replaying a real capture.** `itch_replay` reconstructs the book from a real file and
 prints message counts, gap stats, best bid/ask, and the state checksum:
