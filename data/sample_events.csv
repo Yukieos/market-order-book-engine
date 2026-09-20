@@ -1,0 +1,9 @@
+sequence,exchange_timestamp_ns,type,order_id,side,price_ticks,quantity
+1,1000,add,101,buy,10000,10
+2,1010,add,102,buy,10000,20
+3,1020,add,201,sell,10020,15
+4,1030,modify,102,buy,10010,18
+5,1040,trade,101,buy,10000,4
+6,1050,add,202,sell,10015,8
+7,1060,cancel,201,sell,10020,0
+8,1070,trade,202,sell,10015,8
