@@ -54,3 +54,16 @@ jobs:
         run: cmake -S . -B build-websocket -DCMAKE_BUILD_TYPE=Release -DMARKET_ENABLE_WEBSOCKET=ON
       - name: Build
         run: cmake --build build-websocket -j 2
+
+  io-uring:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install liburing
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev
+      - name: Configure
+        run: cmake -S . -B build-io-uring -DCMAKE_BUILD_TYPE=Release -DMARKET_ENABLE_IO_URING=ON
+      - name: Build
+        run: cmake --build build-io-uring -j 2
+      - name: Test (includes io_uring loopback smoke test)
+        run: ctest --test-dir build-io-uring --output-on-failure

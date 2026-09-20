@@ -105,7 +105,45 @@ stateless `itch::decode_message` decoder handles the book-affecting subset — A
 Order Executed (`E`/`C`), Order Cancel (`X`), Order Delete (`D`), Order Replace (`U`) —
 at fixed big-endian offsets with no allocation. Prices are ITCH's 1/10000 integer units
 mapped onto `Price` ticks. Non-book messages are skipped; a malformed or truncated frame
-stops the stream and is reported by `failed()`.
+stops the stream and is reported by `failed()`. The file connector streams from disk in a
+bounded 64 KiB window, so a day-sized capture need not be held in memory.
+
+**MoldUDP64.** `itch::MoldUdp64Connector` decodes NASDAQ's UDP framing: a
+`DatagramSource` (in-memory, a streaming length-prefixed file, or the optional io_uring
+socket below) yields one packet at a time, and the connector unpacks the 20-byte header
+and length-framed blocks through the same `decode_message`. Because each packet carries
+the sequence of its first message, the connector tracks the expected sequence and reports
+**gaps** (`gaps_detected()` / `messages_missed()`) and skips **overlaps** (retransmits);
+heartbeats and end-of-session are handled.
+
+**Replaying a real capture.** `itch_replay` reconstructs the book from a real file and
+prints message counts, gap stats, best bid/ask, and the state checksum:
+
+```bash
+./build/itch_replay path/to/day.itch                 # BinaryFILE (2-byte-length framing)
+./build/itch_replay path/to/capture.mold --mold      # length-prefixed MoldUDP64 datagrams
+```
+
+### Optional io_uring UDP transport (Linux)
+
+`itch::IoUringDatagramSource` receives UDP datagrams (MoldUDP64 packets) via Linux
+io_uring and composes with `MoldUdp64Connector` unchanged. It is off by default and needs
+`liburing`; macOS cannot build it. CI builds and runs a loopback smoke test on Ubuntu.
+
+```bash
+sudo apt-get install -y liburing-dev
+cmake -S . -B build-io-uring -DCMAKE_BUILD_TYPE=Release -DMARKET_ENABLE_IO_URING=ON
+cmake --build build-io-uring -j
+ctest --test-dir build-io-uring --output-on-failure
+```
+
+### Latency tooling
+
+`market::cycle_now()` reads the CPU cycle counter (x86 TSC / AArch64 virtual counter,
+else `steady_clock`) with a startup-calibrated ns-per-cycle factor, for lower-overhead
+latency sampling. `market::pin_current_thread_to_core()` pins a thread to a core on Linux
+(`pthread_setaffinity_np`) and returns `false` where unsupported (e.g. macOS), so callers
+degrade gracefully. See [ARCHITECTURE.md](ARCHITECTURE.md) section 7.
 
 ## Correctness model
 
@@ -220,9 +258,15 @@ residence: order-book p99 stays near 0.17 us while 110% queue-residence p99 reac
 - Apply mode retains crossing orders by design (it replays a matched feed); match mode
   (`submit`) performs the matching. Self-trade is currently allowed as a documented policy.
 - Capacity is fixed and an exhausted book rejects new orders.
-- The ITCH connector reads the whole framed stream into memory and covers the
-  book-affecting subset (A/F/E/C/X/D/U); MoldUDP64/SoupBinTCP transport, streaming reads,
-  and validation against a real NASDAQ day file remain follow-ups.
+- The ITCH connectors cover the book-affecting subset (A/F/E/C/X/D/U). BinaryFILE reads
+  stream from disk; MoldUDP64 framing with sequence-gap detection is in place. Native
+  SoupBinTCP sessions, MoldUDP64 request-retransmit recovery (gaps are detected but not
+  re-requested), and a checked-in expectation validated against a real NASDAQ day file
+  remain follow-ups.
+- The io_uring transport is Linux-only and CI-verified (loopback), not tuned; multishot
+  receives, registered buffers, huge pages, and NUMA placement are future work.
+- Thread affinity is applied on Linux only; `pin_current_thread_to_core` returns false on
+  platforms (such as macOS) that do not expose core affinity.
 - Best-price queries scan the preallocated level array; a later milestone can add a
   fixed-capacity ordered price index and benchmark the trade-off.
 - Modify priority semantics are documented project semantics, not exchange-specific.
@@ -239,10 +283,15 @@ residence: order-book p99 stays near 0.17 us while 110% queue-residence p99 reac
 ## Repository layout
 
 ```text
-include/market/       public event, order-request, connector, queue, and order-book interfaces
-include/market/itch/  NASDAQ ITCH 5.0 decoder and file/stream connector
-src/                  CSV parser, ITCH connector, order book + matching, replay executable
-tests/                invariant, differential, matching, ITCH round-trip, and concurrency tests
+include/market/       public event, order-request, connector, queue, order-book, time, affinity interfaces
+include/market/itch/  ITCH 5.0 decoder, BinaryFILE + MoldUDP64 connectors, datagram sources, io_uring source
+src/                  CSV/ITCH/MoldUDP64 connectors, order book + matching, affinity, replay tools
+tests/                invariant, differential, matching, ITCH/MoldUDP64, streaming, timing, concurrency tests
 benchmarks/           order-book, matching, ITCH-decode, parsing, and pipeline benchmarks
 data/                 deterministic sample replay
 ```
+
+Executables: `market_replay` (CSV two-thread replay), `itch_replay` (ITCH/MoldUDP64 book
+reconstruction), `market_benchmark`. Optional targets behind CMake flags:
+`market_websocket` (`MARKET_ENABLE_WEBSOCKET`) and `market_io_uring` +
+`io_uring_smoke` (`MARKET_ENABLE_IO_URING`, Linux).

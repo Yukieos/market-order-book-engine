@@ -1,10 +1,15 @@
+#include "market/Affinity.hpp"
 #include "market/CSVReplayConnector.hpp"
 #include "market/OrderBook.hpp"
 #include "market/SpscQueue.hpp"
 #include "market/StateChecksum.hpp"
+#include "market/Time.hpp"
 #include "market/itch/ItchFileConnector.hpp"
+#include "market/itch/MoldUdp64Connector.hpp"
 
 #include <cstddef>
+#include <fstream>
+#include <memory>
 
 #include <algorithm>
 #include <atomic>
@@ -690,6 +695,142 @@ void test_itch_malformed_and_skipped() {
     }
 }
 
+// --- M3 follow-up: MoldUDP64 framing + gap/overlap detection ---
+
+// A MoldUDP64 packet's message-block region uses the same 2-byte-length framing as
+// BinaryFILE, so itch_encode builds it directly.
+std::vector<std::byte> mold_packet(std::uint64_t sequence,
+                                   const std::vector<MarketDataEvent>& events) {
+    std::vector<std::byte> packet;
+    for (int i = 0; i < 10; ++i) packet.push_back(std::byte{0});  // session id
+    put_be(packet, sequence, 8);
+    put_be(packet, static_cast<std::uint64_t>(events.size()), 2);
+    for (const auto& e : events) itch_encode(packet, e);  // each block: length + message
+    return packet;
+}
+
+std::unique_ptr<itch::DatagramSource> in_memory(std::vector<std::vector<std::byte>> datagrams) {
+    return std::make_unique<itch::InMemoryDatagramSource>(std::move(datagrams));
+}
+
+void test_mold_udp64_basic() {
+    const std::vector<MarketDataEvent> first{
+        event(EventType::Add, 10, Side::Buy, 1000, 100),
+        event(EventType::Add, 11, Side::Sell, 1020, 50),
+    };
+    const std::vector<MarketDataEvent> second{event(EventType::Add, 12, Side::Buy, 999, 25)};
+    std::vector<std::vector<std::byte>> datagrams{
+        mold_packet(1, first),
+        mold_packet(0, {}),   // heartbeat (count 0): skipped
+        mold_packet(3, second),
+    };
+    itch::MoldUdp64Connector connector(in_memory(std::move(datagrams)));
+    MarketDataEvent decoded{};
+    std::vector<std::pair<OrderId, std::uint64_t>> got;
+    while (connector.next(decoded)) got.emplace_back(decoded.order_id, decoded.sequence);
+
+    CHECK(!connector.failed());
+    CHECK(connector.messages_decoded() == 3);
+    CHECK(connector.gaps_detected() == 0);
+    CHECK(connector.messages_missed() == 0);
+    CHECK(got.size() == 3);
+    CHECK(got[0].first == 10 && got[0].second == 1);
+    CHECK(got[1].first == 11 && got[1].second == 2);
+    CHECK(got[2].first == 12 && got[2].second == 3);
+}
+
+void test_mold_udp64_gap() {
+    std::vector<std::vector<std::byte>> datagrams{
+        mold_packet(1, {event(EventType::Add, 1, Side::Buy, 100, 10),
+                        event(EventType::Add, 2, Side::Buy, 100, 10)}),  // sequences 1,2
+        mold_packet(5, {event(EventType::Add, 3, Side::Buy, 100, 10)}),  // gap: 3,4 missed
+    };
+    itch::MoldUdp64Connector connector(in_memory(std::move(datagrams)));
+    MarketDataEvent decoded{};
+    std::size_t count = 0;
+    std::uint64_t last_seq = 0;
+    while (connector.next(decoded)) { ++count; last_seq = decoded.sequence; }
+    CHECK(count == 3);
+    CHECK(connector.gaps_detected() == 1);
+    CHECK(connector.messages_missed() == 2);  // sequences 3 and 4
+    CHECK(last_seq == 5);
+}
+
+void test_mold_udp64_overlap() {
+    // Second packet retransmits sequences 2,3 and adds 4; only 4 is new.
+    std::vector<std::vector<std::byte>> datagrams{
+        mold_packet(1, {event(EventType::Add, 1, Side::Buy, 100, 10),
+                        event(EventType::Add, 2, Side::Buy, 100, 10),
+                        event(EventType::Add, 3, Side::Buy, 100, 10)}),
+        mold_packet(2, {event(EventType::Add, 2, Side::Buy, 100, 10),
+                        event(EventType::Add, 3, Side::Buy, 100, 10),
+                        event(EventType::Add, 4, Side::Buy, 100, 10)}),
+    };
+    itch::MoldUdp64Connector connector(in_memory(std::move(datagrams)));
+    MarketDataEvent decoded{};
+    std::vector<OrderId> ids;
+    while (connector.next(decoded)) ids.push_back(decoded.order_id);
+    CHECK(ids.size() == 4);
+    CHECK(ids[0] == 1 && ids[1] == 2 && ids[2] == 3 && ids[3] == 4);
+    CHECK(connector.gaps_detected() == 0);
+    CHECK(connector.messages_missed() == 0);
+}
+
+// --- M3 follow-up: streaming file connector matches the in-memory framer ---
+
+void test_itch_streaming_file_equivalence() {
+    std::vector<MarketDataEvent> script;
+    for (OrderId id = 1; id <= 500; ++id) {
+        script.push_back(event(EventType::Add, id, id % 2 == 0 ? Side::Buy : Side::Sell,
+                               static_cast<Price>(1000 + (id % 20)), 1 + id % 7));
+    }
+    std::vector<std::byte> bytes;
+    for (const auto& e : script) itch_encode(bytes, e);
+
+    const auto path = std::filesystem::temp_directory_path() /
+                      "market_itch_stream_test.bin";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+
+    std::vector<std::byte> bytes_copy(bytes);
+    itch::ItchFileConnector streamed(path);                    // reads from disk in chunks
+    itch::ItchFileConnector in_memory_conn(std::move(bytes_copy));  // whole buffer
+    MarketDataEvent a{};
+    MarketDataEvent b{};
+    std::size_t count = 0;
+    while (streamed.next(a)) {
+        CHECK(in_memory_conn.next(b));
+        CHECK(a == b);
+        ++count;
+    }
+    CHECK(!in_memory_conn.next(b));
+    CHECK(!streamed.failed() && !in_memory_conn.failed());
+    CHECK(count == script.size());
+    std::filesystem::remove(path);
+}
+
+// --- M4: hardware cycle timing and thread affinity ---
+
+void test_hardware_timing() {
+    const auto start = cycle_now();
+    volatile std::uint64_t sink = 0;
+    for (int i = 0; i < 200'000; ++i) sink += static_cast<std::uint64_t>(i);
+    (void)sink;
+    const auto end = cycle_now();
+    CHECK(end >= start);  // the counter is non-decreasing
+    const double ns_per_cycle = calibrate_ns_per_cycle();
+    CHECK(ns_per_cycle > 0.0);
+}
+
+void test_affinity_api() {
+    const bool supported = affinity_supported();
+    const bool pinned = pin_current_thread_to_core(0);
+    if (!supported) CHECK(!pinned);  // unsupported platforms must report false, never crash
+}
+
 }  // namespace
 
 int main() {
@@ -709,6 +850,12 @@ int main() {
         test_reduce_and_replace();
         test_itch_round_trip();
         test_itch_malformed_and_skipped();
+        test_mold_udp64_basic();
+        test_mold_udp64_gap();
+        test_mold_udp64_overlap();
+        test_itch_streaming_file_equivalence();
+        test_hardware_timing();
+        test_affinity_api();
         test_spsc_concurrently();
         std::cout << "all tests passed\n";
     } catch (const std::exception& error) {
