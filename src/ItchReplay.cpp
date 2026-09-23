@@ -1,3 +1,4 @@
+#include "market/MultiSymbolBook.hpp"
 #include "market/OrderBook.hpp"
 #include "market/itch/ItchFileConnector.hpp"
 #include "market/itch/MoldUdp64Connector.hpp"
@@ -71,23 +72,69 @@ void print_summary(const Counts& counts, const OrderBook& book) {
     std::cout << " state_checksum=0x" << std::hex << book.state_checksum() << std::dec << '\n';
 }
 
+Counts apply_all_symbols(DataConnector& connector, MultiSymbolBook& books, std::size_t max_events) {
+    Counts counts;
+    MarketDataEvent event{};
+    while (connector.next(event)) {
+        ++counts.decoded;
+        if (books.process_event(event) == ProcessResult::Applied) ++counts.applied;
+        else ++counts.rejected;
+        if (max_events != 0 && counts.decoded >= max_events) break;
+    }
+    return counts;
+}
+
+void print_symbol_summary(const Counts& counts, const MultiSymbolBook& books) {
+    SymbolId best_symbol = 0;
+    std::size_t best_orders = 0;
+    for (const SymbolId symbol : books.symbols()) {
+        const std::size_t n = books.book(symbol)->order_count();
+        if (n > best_orders) {
+            best_orders = n;
+            best_symbol = symbol;
+        }
+    }
+    std::cout << "decoded=" << counts.decoded << " applied=" << counts.applied
+              << " rejected=" << counts.rejected << " symbols=" << books.symbol_count()
+              << " total_orders=" << books.total_orders()
+              << " most_active_symbol=" << best_symbol << " orders=" << best_orders;
+    if (const auto bid = books.best_bid(best_symbol)) {
+        std::cout << " best_bid=" << bid->price_ticks << "x" << bid->total_quantity;
+    } else {
+        std::cout << " best_bid=none";
+    }
+    if (const auto ask = books.best_ask(best_symbol)) {
+        std::cout << " best_ask=" << ask->price_ticks << "x" << ask->total_quantity;
+    } else {
+        std::cout << " best_ask=none";
+    }
+    std::cout << " state_checksum=0x" << std::hex << books.state_checksum() << std::dec << '\n';
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "usage: itch_replay <file> [--mold] [--capacity N] [--max N]\n";
+        std::cerr << "usage: itch_replay <file> [--mold] [--per-symbol] "
+                     "[--capacity N] [--per-symbol-capacity N] [--max N]\n";
         return 2;
     }
     const std::string path = argv[1];
     bool mold = false;
+    bool per_symbol = false;
     std::size_t capacity = 2'000'000;
+    std::size_t per_symbol_capacity = 8'192;
     std::size_t max_events = 0;
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--mold") {
             mold = true;
+        } else if (arg == "--per-symbol") {
+            per_symbol = true;
         } else if (arg == "--capacity" && i + 1 < argc) {
             capacity = parse_size(argv[++i], capacity);
+        } else if (arg == "--per-symbol-capacity" && i + 1 < argc) {
+            per_symbol_capacity = parse_size(argv[++i], per_symbol_capacity);
         } else if (arg == "--max" && i + 1 < argc) {
             max_events = parse_size(argv[++i], 0);
         } else {
@@ -97,28 +144,43 @@ int main(int argc, char** argv) {
     }
 
     try {
-        OrderBook book(capacity);
+        std::unique_ptr<DataConnector> connector;
+        std::string label;
         if (mold) {
             auto source = std::make_unique<itch::LengthPrefixedDatagramFileSource>(path);
-            itch::MoldUdp64Connector connector(std::move(source));
-            const auto counts = apply_all(connector, book, max_events);
-            std::cout << "source=mold gaps_detected=" << connector.gaps_detected()
-                      << " messages_missed=" << connector.messages_missed()
-                      << " last_sequence=" << connector.last_sequence() << ' ';
-            print_summary(counts, book);
-            if (connector.failed()) {
-                std::cerr << "warning: stream ended on a malformed frame\n";
-                return 1;
-            }
+            connector = std::make_unique<itch::MoldUdp64Connector>(std::move(source));
+            label = "source=mold";
         } else {
-            itch::ItchFileConnector connector(std::filesystem::path{path});
-            const auto counts = apply_all(connector, book, max_events);
-            std::cout << "source=binaryfile ";
+            connector = std::make_unique<itch::ItchFileConnector>(std::filesystem::path{path});
+            label = "source=binaryfile";
+        }
+
+        bool failed = false;
+        if (per_symbol) {
+            MultiSymbolBook books(per_symbol_capacity);
+            const auto counts = apply_all_symbols(*connector, books, max_events);
+            std::cout << label << " mode=per-symbol per_symbol_capacity=" << per_symbol_capacity
+                      << ' ';
+            print_symbol_summary(counts, books);
+        } else {
+            OrderBook book(capacity);
+            const auto counts = apply_all(*connector, book, max_events);
+            std::cout << label << ' ';
             print_summary(counts, book);
-            if (connector.failed()) {
-                std::cerr << "warning: stream ended on a malformed frame\n";
-                return 1;
-            }
+        }
+
+        if (mold) {
+            auto* mold_connector = static_cast<itch::MoldUdp64Connector*>(connector.get());
+            std::cout << "mold_stats gaps_detected=" << mold_connector->gaps_detected()
+                      << " messages_missed=" << mold_connector->messages_missed()
+                      << " last_sequence=" << mold_connector->last_sequence() << '\n';
+            failed = mold_connector->failed();
+        } else {
+            failed = static_cast<itch::ItchFileConnector*>(connector.get())->failed();
+        }
+        if (failed) {
+            std::cerr << "warning: stream ended on a malformed frame\n";
+            return 1;
         }
     } catch (const std::exception& error) {
         std::cerr << "itch_replay error: " << error.what() << '\n';

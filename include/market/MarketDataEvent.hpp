@@ -8,6 +8,7 @@ namespace market {
 using OrderId = std::uint64_t;
 using Price = std::int64_t;
 using Quantity = std::uint64_t;
+using SymbolId = std::uint32_t;  // ITCH stock_locate (16-bit); 0 = unspecified / single-symbol feed
 
 // Add/Modify/Cancel/Trade come from Milestone 1. Reduce and Replace were added for
 // real matched feeds (e.g. NASDAQ ITCH 5.0; see ARCHITECTURE.md section 2.2):
@@ -21,6 +22,7 @@ enum class Side : std::uint8_t { Buy, Sell };
 struct MarketDataEvent {
     std::uint64_t sequence{};
     std::uint64_t exchange_timestamp_ns{};
+    SymbolId symbol{};         // ITCH stock_locate; routes to a per-symbol book
     EventType type{};
     OrderId order_id{};        // for Replace: the original order reference
     OrderId new_order_id{};    // only meaningful for Replace

@@ -15,6 +15,7 @@ add_library(market_engine
     src/CSVReplayConnector.cpp
     src/ItchFileConnector.cpp
     src/MoldUdp64Connector.cpp
+    src/MultiSymbolBook.cpp
     src/OrderBook.cpp
     src/SoupBinTcpConnector.cpp
 )

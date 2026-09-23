@@ -78,6 +78,8 @@ inline constexpr std::size_t kLenOrderReplace = 35;
     if (len == 0) return {DecodeStatus::Malformed, {}};
     const auto type = static_cast<char>(std::to_integer<unsigned char>(data[0]));
     MarketDataEvent event{};
+    // stock_locate is the 2-byte field at offset 1 in every ITCH message.
+    if (len >= 3) event.symbol = read_be16(data + 1);
 
     const auto set_side = [](std::byte b, Side& side) noexcept -> bool {
         const char c = static_cast<char>(std::to_integer<unsigned char>(b));

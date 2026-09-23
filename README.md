@@ -129,7 +129,16 @@ prints message counts, gap stats, best bid/ask, and the state checksum:
 ```bash
 ./build/itch_replay path/to/day.itch                 # BinaryFILE (2-byte-length framing)
 ./build/itch_replay path/to/capture.mold --mold      # length-prefixed MoldUDP64 datagrams
+./build/itch_replay path/to/day.itch --per-symbol    # one book per stock_locate; real per-symbol BBO
 ```
+
+**Per-symbol books.** `MultiSymbolBook` routes each event to its own `OrderBook` by ITCH
+`stock_locate` (now carried on `MarketDataEvent`), created lazily and indexed for O(1)
+routing. Without this, a multi-symbol feed collapses into one book and best bid/ask become a
+meaningless cross-symbol extremum. On a real NASDAQ prefix, `--per-symbol` reconstructs
+3,378 symbols with a proper uncrossed BBO for the busiest one ($159.80 × 6 / $160.00 × 100),
+versus the crossed nonsense a single shared book reports. This is the prerequisite for the
+per-symbol research layer (see [docs/research-platform.md](docs/research-platform.md)).
 
 ### Optional io_uring UDP transport (Linux)
 

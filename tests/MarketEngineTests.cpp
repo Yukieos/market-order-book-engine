@@ -1,5 +1,6 @@
 #include "market/Affinity.hpp"
 #include "market/CSVReplayConnector.hpp"
+#include "market/MultiSymbolBook.hpp"
 #include "market/OrderBook.hpp"
 #include "market/SpscQueue.hpp"
 #include "market/StateChecksum.hpp"
@@ -942,6 +943,50 @@ void test_soupbintcp_malformed() {
     CHECK(connector.failed());
 }
 
+// --- Phase 1: per-symbol books ---
+
+void test_multi_symbol_routing() {
+    MultiSymbolBook multi(64);
+    OrderBook ref7(64);
+    OrderBook ref42(64);
+    const auto apply = [&](SymbolId symbol, EventType type, OrderId id, Side side,
+                           Price price, Quantity quantity) {
+        MarketDataEvent e = event(type, id, side, price, quantity);
+        e.symbol = symbol;
+        OrderBook& reference = symbol == 7 ? ref7 : ref42;
+        CHECK(multi.process_event(e) == reference.process_event(e));
+    };
+
+    apply(7, EventType::Add, 1, Side::Buy, 100, 10);
+    apply(42, EventType::Add, 1, Side::Buy, 200, 7);   // same order id, different symbol
+    apply(7, EventType::Add, 2, Side::Sell, 105, 5);
+    apply(42, EventType::Add, 3, Side::Sell, 210, 4);
+    apply(7, EventType::Add, 3, Side::Buy, 101, 8);
+    apply(42, EventType::Cancel, 1, Side::Buy, 0, 0);  // remove symbol 42's only bid
+
+    CHECK(multi.symbol_count() == 2);
+    CHECK(multi.book(7)->levels() == ref7.levels());
+    CHECK(multi.book(42)->levels() == ref42.levels());
+    CHECK(multi.book(99) == nullptr);  // never seen
+
+    // Per-symbol BBO is independent (this is the whole point of Phase 1).
+    CHECK(multi.best_bid(7)->price_ticks == 101);
+    CHECK(multi.best_ask(7)->price_ticks == 105);
+    CHECK(!multi.best_bid(42).has_value());
+    CHECK(multi.best_ask(42)->price_ticks == 210);
+
+    CHECK(multi.total_orders() == ref7.order_count() + ref42.order_count());
+    CHECK(multi.state_checksum() ==
+          (checksum_mix(7) ^ ref7.state_checksum() ^ checksum_mix(42) ^ ref42.state_checksum()));
+
+    // Out-of-range symbol is rejected, not routed.
+    MarketDataEvent bad = event(EventType::Add, 5, Side::Buy, 100, 1);
+    bad.symbol = 1u << 16;  // == max_symbols
+    MultiSymbolBook small(64, 1u << 16);
+    CHECK(small.process_event(bad) == ProcessResult::CapacityExhausted);
+    CHECK(small.symbol_count() == 0);
+}
+
 // --- M4: hardware cycle timing and thread affinity ---
 
 void test_hardware_timing() {
@@ -988,6 +1033,7 @@ int main() {
         test_itch_streaming_file_equivalence();
         test_soupbintcp();
         test_soupbintcp_malformed();
+        test_multi_symbol_routing();
         test_hardware_timing();
         test_affinity_api();
         test_spsc_concurrently();
