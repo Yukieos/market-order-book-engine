@@ -153,6 +153,22 @@ cmake --build build-io-uring -j
 ctest --test-dir build-io-uring --output-on-failure
 ```
 
+### Signal research (Phase 2)
+
+`itch_features <file> --locate N` replays one symbol and emits a leakage-proof, columnar
+L1 feature stream (one row per top-of-book change); `analysis/signal_validity.py` reads it
+and reports the **rank-IC decay** of order-book imbalance (and an OFI baseline) against
+future mid-returns, with a moving-block-bootstrap CI. C++ emits only post-event integer
+state; labels (forward returns) are computed in Python, so the feature side cannot leak the
+future. See [docs/research-platform.md](docs/research-platform.md) for the methodology and
+the honest single-symbol/one-day caveat.
+
+```bash
+./build/itch_replay data/day.itch --per-symbol         # find an active locate
+./build/itch_features data/day.itch --locate 676 --out features.csv
+python3 analysis/signal_validity.py features.csv
+```
+
 ### Latency tooling
 
 `market::cycle_now()` reads the CPU cycle counter (x86 TSC / AArch64 virtual counter,

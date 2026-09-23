@@ -288,3 +288,103 @@ Single-writer book on the consumer thread; SPSC transport untouched; integer tic
 preallocated pools; `noexcept` allocation-free hot paths for `process_event` **and**
 `submit`; differential oracle + property/fuzz tests; ASan/UBSan/TSan clean; benchmarks
 with committed machine specs and raw output. Every M2/M3 PR must keep all of these green.
+
+---
+
+## 7. Transport & timing (M3 follow-ups + M4)
+
+These layers sit *in front of* the book and are deliberately decoupled so a byte source
+can be swapped without touching decode or matching.
+
+```text
+byte / datagram source            framing                decode              book
+─────────────────────             ────────────           ─────────────       ──────────
+InMemory / file (BinaryFILE) ─┐
+LengthPrefixed file (MoldUDP) ─┼─▶ 2-byte length  ─┐
+io_uring UDP socket (Linux) ──┘    MoldUDP64 hdr  ─┴─▶ itch::decode_message ─▶ process_event
+```
+
+### 7.1 Datagram source abstraction
+`itch::DatagramSource` yields one datagram (one MoldUDP64 packet) at a time, each valid
+until the next call. Implementations: `InMemoryDatagramSource` (tests / pre-captured),
+`LengthPrefixedDatagramFileSource` (streaming file replay, 4-byte-length container), and
+`IoUringDatagramSource` (Linux). This is the single seam where the transport plugs in.
+
+### 7.2 MoldUDP64 (`itch::MoldUdp64Connector`)
+Parses the 20-byte MoldUDP64 header (session, 8-byte sequence, 2-byte count) and the
+length-framed message blocks, decoding each with `itch::decode_message`. Because the
+header carries the sequence of the packet's first message, the connector tracks the
+expected next sequence and reports **gaps** (missed sequence numbers) and skips
+**overlaps** (retransmitted messages already delivered). Heartbeats (count 0) and
+end-of-session (count 0xFFFF) are handled. This is the roadmap's "sequence-gap detection".
+
+**Retransmit recovery.** An optional `RetransmitSource` models a rewind/retransmission
+server: on a gap, the connector requests each missing sequence and splices recovered
+messages into the delivered stream in order, so downstream sees a gap-free feed;
+sequences that cannot be recovered are counted as genuinely missed. This is the recovery
+*loop and interface* — a live deployment backs `RetransmitSource` with a UDP request
+channel to the exchange's retransmit host.
+
+### 7.3 Streaming reads
+`ItchFileConnector` now frames from a fixed 64 KiB window refilled from disk (compact +
+read), so day-sized captures need not be resident. The in-memory constructor and its
+behavior are unchanged; both share one framer. `next()` stays allocation-free in steady
+state (the window only grows for a message larger than itself, which ITCH never emits).
+
+### 7.4 io_uring receive (Linux, `MARKET_ENABLE_IO_URING`)
+`IoUringDatagramSource` receives UDP datagrams via io_uring (pimpl keeps liburing out of
+the header). It is a `DatagramSource`, so it composes with `MoldUdp64Connector`
+unchanged. **macOS cannot build or run this**; it is compiled behind a CMake flag and
+covered by a loopback smoke test in the Ubuntu `io-uring` CI job. A zero-length datagram
+is the end-of-stream sentinel used by tooling.
+
+### 7.5 Hardware timing & affinity
+`market::cycle_now()` (`Time.hpp`) reads the CPU cycle counter (x86 TSC / AArch64
+`cntvct_el0`, else `steady_clock`) with a startup-calibrated ns-per-cycle factor, for
+lower-overhead latency sampling than `steady_clock`. `market::pin_current_thread_to_core`
+(`Affinity.hpp`) pins a thread on Linux (`pthread_setaffinity_np`) and reports `false`
+where unsupported (macOS), so callers degrade gracefully.
+
+### 7.6 SoupBinTCP (`itch::SoupBinTcpConnector`)
+Frames NASDAQ's TCP session layer (2-byte length = 1-byte type + payload) and decodes the
+ITCH payload of each Sequenced Data packet (`S`), advancing an implicit sequence; End of
+Session (`Z`) ends the stream, and heartbeat/login/debug/unsequenced packets are skipped.
+This is the reusable framing/decoding core; the TCP login handshake and heartbeat exchange
+are out of scope. It reuses the same bounded-window streaming framer as ItchFileConnector.
+
+### 7.7 `itch_replay` tool and real-data validation
+`src/ItchReplay.cpp` reconstructs a book from a real capture — BinaryFILE by default, or
+`--mold` for a length-prefixed MoldUDP64 capture — and prints message counts, gap stats,
+best bid/ask, and the state checksum. It has been run against a prefix of a real NASDAQ
+TotalView-ITCH 5.0 sample day (`01302019.NASDAQ_ITCH50`), decoding **4,078,307 real
+messages with zero rejects** via the streaming connector and correctly flagging the
+truncated tail. Per-symbol books are now available (`MultiSymbolBook`, §7.10): the decoder
+carries `stock_locate` on `MarketDataEvent`, and `itch_replay --per-symbol` routes each
+symbol to its own book — on the same prefix that yields 3,378 symbols and a proper
+uncrossed BBO for the busiest symbol ($159.80 × 6 / $160.00 × 100), instead of the
+cross-symbol extremum a single shared book produced.
+
+### 7.8 End-to-end io_uring pipeline benchmark
+`benchmarks/IoUringPipelineBench.cpp` (Linux, behind the flag) wires a paced UDP sender ->
+io_uring receive -> MoldUDP64 decode (producer, pinned) -> SPSC queue -> order book
+(consumer, pinned), and reports the transport->book latency decomposition (queue
+residence, book processing, end-to-end) in ns via the calibrated cycle counter. Numbers
+are rough and host-dependent; on ARM the virtual counter is coarse (~24 MHz, ~42 ns/tick)
+and a shared VM adds jitter and can drop datagrams (the gap counter surfaces this).
+
+### 7.10 Per-symbol books (`MultiSymbolBook`)
+`MarketDataEvent` now carries `symbol` (ITCH `stock_locate`, read at offset 1 of every
+message). `MultiSymbolBook` holds one `OrderBook` per symbol, created lazily on first sight
+and indexed by id for O(1) routing with no hot-path allocation; it exposes per-symbol
+`best_bid`/`best_ask`, aggregate `symbol_count`/`total_orders`, and an order-independent
+state checksum keyed by symbol. This is the prerequisite for per-symbol microstructure
+research (see [docs/research-platform.md](docs/research-platform.md)). A single symbol's
+peak resting-order count is far below a whole feed's, so each per-symbol book uses a small
+fixed capacity. Building *all* symbols with independent pools is memory-bound; a shared
+order arena across symbols is a future optimization (the research workflow studies one
+symbol at a time, so it is not on the critical path).
+
+### 7.11 Still open
+A live SoupBinTCP session (login handshake, heartbeats) and a real UDP request channel
+behind `RetransmitSource`; a shared cross-symbol order arena; multishot / registered-buffer
+io_uring; and huge-page / NUMA placement remain future work.

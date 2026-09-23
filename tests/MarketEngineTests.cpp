@@ -5,6 +5,7 @@
 #include "market/SpscQueue.hpp"
 #include "market/StateChecksum.hpp"
 #include "market/Time.hpp"
+#include "market/research/Features.hpp"
 #include "market/itch/ItchFileConnector.hpp"
 #include "market/itch/MoldUdp64Connector.hpp"
 #include "market/itch/SoupBinTcpConnector.hpp"
@@ -987,6 +988,31 @@ void test_multi_symbol_routing() {
     CHECK(small.symbol_count() == 0);
 }
 
+// --- Phase 2: L1 feature extraction (post-event, leakage-proof) ---
+
+void test_l1_features() {
+    OrderBook book(16);
+    book.process_event(event(EventType::Add, 1, Side::Buy, 100, 10));
+    const auto r1 = research::l1_row(1, 1000, book);
+    CHECK(!r1.two_sided);  // only a bid so far
+    CHECK(r1.bid_px == 100 && r1.bid_sz == 10 && r1.ask_px == 0 && r1.ask_sz == 0);
+
+    book.process_event(event(EventType::Add, 2, Side::Sell, 105, 5));
+    const auto r2 = research::l1_row(2, 2000, book);
+    CHECK(r2.two_sided);
+    CHECK(r2.bid_px == 100 && r2.bid_sz == 10 && r2.ask_px == 105 && r2.ask_sz == 5);
+    CHECK(research::l1_changed(r1, r2));
+
+    book.process_event(event(EventType::Add, 3, Side::Buy, 100, 10));  // deepen best bid
+    const auto r3 = research::l1_row(3, 3000, book);
+    CHECK(r3.bid_sz == 20);
+    CHECK(research::l1_changed(r2, r3));
+
+    // Same L1 state at a later event: not a change (sampling clock is L1 updates).
+    const auto r3_again = research::l1_row(4, 4000, book);
+    CHECK(!research::l1_changed(r3, r3_again));
+}
+
 // --- M4: hardware cycle timing and thread affinity ---
 
 void test_hardware_timing() {
@@ -1034,6 +1060,7 @@ int main() {
         test_soupbintcp();
         test_soupbintcp_malformed();
         test_multi_symbol_routing();
+        test_l1_features();
         test_hardware_timing();
         test_affinity_api();
         test_spsc_concurrently();

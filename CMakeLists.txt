@@ -72,6 +72,12 @@ target_compile_options(itch_replay PRIVATE
     $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall -Wextra -Wpedantic -Wconversion>
 )
 
+add_executable(itch_features src/ItchFeatures.cpp)
+target_link_libraries(itch_features PRIVATE market_engine Threads::Threads)
+target_compile_options(itch_features PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall -Wextra -Wpedantic -Wconversion>
+)
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(market_tests tests/MarketEngineTests.cpp)
