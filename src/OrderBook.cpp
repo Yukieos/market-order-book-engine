@@ -478,6 +478,19 @@ std::vector<LevelView> OrderBook::levels() const {
     return result;
 }
 
+std::vector<OrderId> OrderBook::level_order_ids(Side side, Price price) const {
+    std::vector<OrderId> ids;
+    const auto level_index = find_level_index(side, price);
+    if (level_index == npos) return ids;
+    ids.reserve(levels_[level_index].order_count);
+    auto index = levels_[level_index].head;
+    while (index != npos) {
+        ids.push_back(orders_[index].id);
+        index = orders_[index].next;
+    }
+    return ids;
+}
+
 std::vector<OrderView> OrderBook::orders_in_priority() const {
     std::vector<OrderView> result;
     result.reserve(active_orders_);

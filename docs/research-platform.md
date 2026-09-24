@@ -310,8 +310,16 @@ Execution/replay — the hard-to-fake half — is largely done. The work is the 
    because the ~2,900-tick pre-market spread dominates, so latency is second-order here.
    That is exactly why the signal must be tested with a **passive** strategy that does not
    pay the spread (Phases 4-5), where queue position and adverse selection become the story._
-4. **MBO queue model** — displayed & conservative bounds; A/E/C/X/D/U ahead-quantity
-   accounting; hand-worked scenario tests.
+4. **MBO queue model** — ✅ done (2026-09-23). `QueueModel` (research/QueueModel.hpp) tracks
+   a hypothetical passive order's ahead-quantity from order-by-order A/E/C/X/D/U events
+   (executions consume the queue then fill us; a cancel of a *known ahead* order advances
+   us, a cancel behind us does not), with **displayed** (multiplier 1.0) and **conservative**
+   (hidden-liquidity buffer > 1.0) bounds. `OrderBook::level_order_ids` snapshots the ahead
+   cohort. Three hand-worked scenario tests (execution fill, conservative penalty, cancel
+   ahead vs behind); ASan/UBSan/TSan clean. `itch_queue` runs the fill study on real data.
+   _Real result (symbol 676): passive fill rate 27.5% (displayed) → 13.3% (2×) → 2.4% (3×)
+   — a wide, honest band showing how much fill rate depends on unobservable liquidity
+   assumptions._
 5. **Economic model** — latency, fees/rebates, markout/adverse-selection; waterfall +
    factorial grid + interactions.
 6. **Baselines** — TOB imbalance, multi-level, OFI, inventory-aware; comparison + at least

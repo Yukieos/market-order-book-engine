@@ -215,7 +215,13 @@ live in the design doc.
   / latency-delay / determinism tests; sanitizers clean. First real finding: on symbol 676's
   pre-market prefix the crossing strategy loses ~2.15M ticks and PnL barely moves with latency
   (0→10 ms) because the ~2,900-tick spread dominates — motivating a **passive** strategy next.
-  **Next: Phase 4 (MBO queue model, displayed + conservative bounds).**
+- **Phase 4 — MBO queue model:** ✅ done (2026-09-23). `QueueModel` tracks a passive order's
+  ahead-quantity from order-by-order A/E/C/X/D/U (executions fill; cancel-ahead advances,
+  cancel-behind doesn't) with displayed + conservative (hidden-liquidity) bounds;
+  `OrderBook::level_order_ids` snapshots the cohort; `itch_queue` runs the fill study. Three
+  hand-worked scenario tests; sanitizers clean. Real result (symbol 676): passive fill rate
+  27.5% (displayed) → 2.4% (3× conservative) — a wide, honest band. **Next: Phase 5 (economic
+  model: latency, fees, markout / adverse selection; waterfall + factorial grid).**
 
 ### M5 — Microstructure analytics + Python surface _(research/ML reach)_
 - **Deliverable:** O(1)-ish best-price (ordered index or bitset + `tzcnt`/`lzcnt`) to unlock

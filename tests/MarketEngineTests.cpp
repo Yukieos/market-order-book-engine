@@ -7,6 +7,7 @@
 #include "market/Time.hpp"
 #include "market/research/Backtest.hpp"
 #include "market/research/Features.hpp"
+#include "market/research/QueueModel.hpp"
 #include "market/itch/ItchFileConnector.hpp"
 #include "market/itch/MoldUdp64Connector.hpp"
 #include "market/itch/SoupBinTcpConnector.hpp"
@@ -1094,6 +1095,85 @@ void test_backtest_determinism() {
     CHECK(a.position == b.position && a.cash_ticks == b.cash_ticks && a.trades == b.trades);
 }
 
+// --- Phase 4: MBO queue-position model ---
+
+void test_queue_model_displayed() {
+    OrderBook book(64);
+    book.process_event(event(EventType::Add, 1, Side::Buy, 100, 10));
+    book.process_event(event(EventType::Add, 2, Side::Buy, 100, 5));
+    const auto ids = book.level_order_ids(Side::Buy, 100);
+    CHECK(ids.size() == 2 && ids[0] == 1 && ids[1] == 2);  // FIFO order
+    std::unordered_set<OrderId> cohort(ids.begin(), ids.end());
+    research::QueueModel q(Side::Buy, 100, 100, 15, 1.0, cohort, 0);
+    CHECK(q.ahead() == 15.0);
+
+    auto e1 = event(EventType::Trade, 1, Side::Buy, 100, 10);  // execute the front ahead order
+    q.on_event(e1, book);
+    book.process_event(e1);
+    CHECK(q.ahead() == 5.0 && q.filled() == 0);
+
+    auto e2 = event(EventType::Trade, 2, Side::Buy, 100, 5);   // exhaust the ahead queue
+    q.on_event(e2, book);
+    book.process_event(e2);
+    CHECK(q.ahead() == 0.0 && q.filled() == 0);
+
+    auto e3 = event(EventType::Add, 3, Side::Buy, 100, 50);    // arrives behind us
+    q.on_event(e3, book);
+    book.process_event(e3);
+    CHECK(q.filled() == 0);
+
+    auto e4 = event(EventType::Trade, 3, Side::Buy, 100, 30);  // execution past the queue fills us
+    q.on_event(e4, book);
+    book.process_event(e4);
+    CHECK(q.filled() == 30 && q.active());
+}
+
+void test_queue_model_conservative() {
+    OrderBook book(64);
+    book.process_event(event(EventType::Add, 1, Side::Buy, 100, 10));
+    book.process_event(event(EventType::Add, 2, Side::Buy, 100, 5));
+    const auto ids = book.level_order_ids(Side::Buy, 100);
+    std::unordered_set<OrderId> cohort(ids.begin(), ids.end());
+    research::QueueModel q(Side::Buy, 100, 100, 15, 2.0, cohort, 0);  // hidden-liquidity buffer
+    CHECK(q.ahead() == 30.0);
+
+    auto e1 = event(EventType::Trade, 1, Side::Buy, 100, 10);
+    q.on_event(e1, book);
+    book.process_event(e1);
+    auto e2 = event(EventType::Trade, 2, Side::Buy, 100, 5);
+    q.on_event(e2, book);
+    book.process_event(e2);
+    CHECK(q.ahead() == 15.0 && q.filled() == 0);  // consumed 15 of the inflated 30
+
+    auto e3 = event(EventType::Add, 3, Side::Buy, 100, 50);
+    q.on_event(e3, book);
+    book.process_event(e3);
+    auto e4 = event(EventType::Trade, 3, Side::Buy, 100, 30);
+    q.on_event(e4, book);
+    book.process_event(e4);
+    CHECK(q.filled() == 15);  // conservative fills 15 where displayed fills 30
+}
+
+void test_queue_model_cancel_ahead_vs_behind() {
+    OrderBook book(64);
+    book.process_event(event(EventType::Add, 1, Side::Buy, 100, 10));
+    book.process_event(event(EventType::Add, 2, Side::Buy, 100, 5));
+    const auto ids = book.level_order_ids(Side::Buy, 100);
+    std::unordered_set<OrderId> cohort(ids.begin(), ids.end());
+    research::QueueModel q(Side::Buy, 100, 100, 15, 1.0, cohort, 0);
+
+    auto cancel_ahead = event(EventType::Cancel, 1);  // an ahead order leaves: we advance
+    q.on_event(cancel_ahead, book);
+    book.process_event(cancel_ahead);
+    CHECK(q.ahead() == 5.0);
+
+    book.process_event(event(EventType::Add, 3, Side::Buy, 100, 7));  // arrives behind us
+    auto cancel_behind = event(EventType::Cancel, 3);
+    q.on_event(cancel_behind, book);
+    book.process_event(cancel_behind);
+    CHECK(q.ahead() == 5.0);  // a cancel behind us does not advance our queue
+}
+
 // --- M4: hardware cycle timing and thread affinity ---
 
 void test_hardware_timing() {
@@ -1145,6 +1225,9 @@ int main() {
         test_backtest_handworked();
         test_backtest_latency_delays_fill();
         test_backtest_determinism();
+        test_queue_model_displayed();
+        test_queue_model_conservative();
+        test_queue_model_cancel_ahead_vs_behind();
         test_hardware_timing();
         test_affinity_api();
         test_spsc_concurrently();

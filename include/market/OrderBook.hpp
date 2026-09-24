@@ -52,6 +52,9 @@ public:
     [[nodiscard]] std::optional<LevelView> best_ask() const noexcept;
     [[nodiscard]] std::vector<OrderView> orders_in_priority() const;
     [[nodiscard]] std::vector<LevelView> levels() const;
+    // Order ids resting at a price level, in FIFO (price-time) order. Used to snapshot the
+    // "ahead" cohort for the passive-order queue model (research/QueueModel.hpp).
+    [[nodiscard]] std::vector<OrderId> level_order_ids(Side side, Price price) const;
     [[nodiscard]] std::uint64_t state_checksum() const noexcept;
     [[nodiscard]] std::size_t order_count() const noexcept { return active_orders_; }
     [[nodiscard]] std::size_t capacity() const noexcept { return orders_.size(); }

@@ -183,6 +183,22 @@ ladder's upper bound; the MBO queue model and fees/markout come next), and an
 ./build/itch_backtest data/day.itch --locate 676 --latency-ns 100000 --enter 0.35
 ```
 
+### MBO queue model (Phase 4)
+
+`itch_queue` posts non-overlapping hypothetical passive orders at the touch and measures
+how often they would fill, using an order-by-order **queue-position model**
+(`research/QueueModel.hpp`): executions consume the displayed queue ahead of you and then
+fill you; a cancel of a *known ahead* order advances you, a cancel behind you does not.
+Run it once per model to get the honest **displayed vs conservative** band — `--multiplier
+1.0` follows the visible book, `> 1.0` inflates the ahead-quantity to stand in for
+hidden/iceberg liquidity you cannot observe. Results are simulated fill *opportunities*
+(small-order, no-impact, history-unchanged counterfactual), not executable live PnL.
+
+```bash
+./build/itch_queue data/day.itch --locate 676 --side buy --multiplier 1.0   # displayed
+./build/itch_queue data/day.itch --locate 676 --side buy --multiplier 3.0   # conservative
+```
+
 ### Latency tooling
 
 `market::cycle_now()` reads the CPU cycle counter (x86 TSC / AArch64 virtual counter,
