@@ -12,6 +12,7 @@ find_package(Threads REQUIRED)
 
 add_library(market_engine
     src/Affinity.cpp
+    src/Backtest.cpp
     src/CSVReplayConnector.cpp
     src/ItchFileConnector.cpp
     src/MoldUdp64Connector.cpp
@@ -75,6 +76,12 @@ target_compile_options(itch_replay PRIVATE
 add_executable(itch_features src/ItchFeatures.cpp)
 target_link_libraries(itch_features PRIVATE market_engine Threads::Threads)
 target_compile_options(itch_features PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall -Wextra -Wpedantic -Wconversion>
+)
+
+add_executable(itch_backtest src/ItchBacktest.cpp)
+target_link_libraries(itch_backtest PRIVATE market_engine Threads::Threads)
+target_compile_options(itch_backtest PRIVATE
     $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall -Wextra -Wpedantic -Wconversion>
 )
 

@@ -208,7 +208,14 @@ live in the design doc.
   leakage-proof per-event L1 feature stream; `analysis/signal_validity.py` computes
   rank-IC decay + OFI baseline with block-bootstrap CIs. Real NASDAQ result: book
   imbalance IC ≈ 0.14 at 1–2 steps, decaying to noise by ~10–20 steps. Feature-extraction
-  unit test + sanitizers clean. **Next: Phase 3 (event-driven backtest loop + time model).**
+  unit test + sanitizers clean.
+- **Phase 3 — backtest loop + time model:** ✅ done (2026-09-23). `Backtester` — single-pass,
+  leak-free, `feature/decision/arrival` time model, frictionless-crossing fill (the upper
+  bound), fixed-point ledger flattened at end, run checksum; `itch_backtest` tool. Hand-worked
+  / latency-delay / determinism tests; sanitizers clean. First real finding: on symbol 676's
+  pre-market prefix the crossing strategy loses ~2.15M ticks and PnL barely moves with latency
+  (0→10 ms) because the ~2,900-tick spread dominates — motivating a **passive** strategy next.
+  **Next: Phase 4 (MBO queue model, displayed + conservative bounds).**
 
 ### M5 — Microstructure analytics + Python surface _(research/ML reach)_
 - **Deliverable:** O(1)-ish best-price (ordered index or bitset + `tzcnt`/`lzcnt`) to unlock

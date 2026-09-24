@@ -297,8 +297,19 @@ Execution/replay — the hard-to-fake half — is largely done. The work is the 
    extraction unit-tested; ASan/UBSan/TSan clean. The fast decay motivates Phase 5's
    latency sensitivity. _(Honest caveat, printed by the script: single symbol/day is an
    illustration, not significance or stability.)_
-3. **Backtest loop + time model** — `feature/decision/arrival`; strategy sees only past
-   state; fixed-point ledger; determinism checksum + metadata.
+3. **Backtest loop + time model** — ✅ done (2026-09-23). `Backtester` (src/Backtest.cpp)
+   is a single-pass, leak-free loop with the explicit `feature/decision/arrival` time
+   model: a hysteresis imbalance strategy sees only post-event L1 state, its decision
+   enters the sim at `decision + latency`, and a crossing order fills at the opposite touch
+   on arrival (the frictionless upper bound; MBO queue + fees/markout are Phases 4-5). The
+   ledger is integer/fixed-point, flattened at session end, and covered by a deterministic
+   run checksum. `itch_backtest` runs it on a real symbol. Tests: hand-worked PnL,
+   latency-delays-fill, run-to-run determinism; ASan/UBSan/TSan clean.
+   _First real finding (symbol 676, pre-market prefix): the frictionless-crossing strategy
+   loses ~2.15M ticks over 472 trades and PnL barely moves from 0 to 10 ms latency —
+   because the ~2,900-tick pre-market spread dominates, so latency is second-order here.
+   That is exactly why the signal must be tested with a **passive** strategy that does not
+   pay the spread (Phases 4-5), where queue position and adverse selection become the story._
 4. **MBO queue model** — displayed & conservative bounds; A/E/C/X/D/U ahead-quantity
    accounting; hand-worked scenario tests.
 5. **Economic model** — latency, fees/rebates, markout/adverse-selection; waterfall +

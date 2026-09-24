@@ -5,6 +5,7 @@
 #include "market/SpscQueue.hpp"
 #include "market/StateChecksum.hpp"
 #include "market/Time.hpp"
+#include "market/research/Backtest.hpp"
 #include "market/research/Features.hpp"
 #include "market/itch/ItchFileConnector.hpp"
 #include "market/itch/MoldUdp64Connector.hpp"
@@ -1013,6 +1014,86 @@ void test_l1_features() {
     CHECK(!research::l1_changed(r3, r3_again));
 }
 
+// --- Phase 3: event-driven backtest loop + time model ---
+
+MarketDataEvent sym_event(SymbolId symbol, EventType type, OrderId id, Side side, Price price,
+                          Quantity quantity, std::uint64_t timestamp_ns) {
+    MarketDataEvent e = event(type, id, side, price, quantity);
+    e.symbol = symbol;
+    e.exchange_timestamp_ns = timestamp_ns;
+    return e;
+}
+
+void test_backtest_handworked() {
+    research::BacktestConfig cfg;
+    cfg.locate = 5;
+    cfg.latency_ns = 0;  // frictionless-immediate upper bound
+    cfg.order_size = 1;
+    cfg.enter_threshold = 0.30;
+    cfg.exit_threshold = 0.10;
+    research::Backtester bt(cfg, 64);
+
+    bt.on_event(sym_event(5, EventType::Add, 1, Side::Buy, 100, 10, 1000));   // one-sided
+    bt.on_event(sym_event(5, EventType::Add, 2, Side::Sell, 101, 5, 1010));   // imb +0.33 -> Long, buy1@101
+    bt.on_event(sym_event(5, EventType::Add, 3, Side::Sell, 101, 95, 1020));  // imb -0.82 -> Short, sell2@100
+    bt.on_event(sym_event(5, EventType::Add, 4, Side::Buy, 100, 90, 1030));   // imb 0 -> Flat, buy1@101
+    const auto r = bt.finish();
+
+    CHECK(r.trades == 3);
+    CHECK(r.position == 0);
+    CHECK(r.cash_ticks == -2);       // -101 + 200 - 101
+    CHECK(r.final_pnl_2x == -4);     // flat, so realized PnL = -2 ticks
+    CHECK(r.unfilled == 0);
+    const auto& f = bt.fills();
+    CHECK(f.size() == 3);
+    CHECK(f[0].side == Side::Buy && f[0].price == 101 && f[0].quantity == 1);
+    CHECK(f[1].side == Side::Sell && f[1].price == 100 && f[1].quantity == 2);
+    CHECK(f[2].side == Side::Buy && f[2].price == 101 && f[2].quantity == 1);
+}
+
+void test_backtest_latency_delays_fill() {
+    research::BacktestConfig cfg;
+    cfg.locate = 5;
+    cfg.latency_ns = 100;
+    cfg.order_size = 1;
+    research::Backtester bt(cfg, 64);
+
+    bt.on_event(sym_event(5, EventType::Add, 1, Side::Buy, 100, 10, 1000));
+    bt.on_event(sym_event(5, EventType::Add, 2, Side::Sell, 101, 5, 1000));  // decide Long, arrival=1100
+    CHECK(bt.fills().empty());                                                // not arrived
+    bt.on_event(sym_event(5, EventType::Add, 3, Side::Buy, 100, 1, 1050));    // ts 1050 < 1100
+    CHECK(bt.fills().empty());
+    bt.on_event(sym_event(5, EventType::Add, 4, Side::Buy, 100, 1, 1200));    // ts 1200 >= 1100 -> release
+    CHECK(bt.fills().size() == 1);
+    CHECK(bt.fills()[0].timestamp_ns == 1100);  // stamped at arrival, not decision
+    CHECK(bt.fills()[0].side == Side::Buy && bt.fills()[0].price == 101);
+}
+
+void test_backtest_determinism() {
+    const auto run = [] {
+        research::BacktestConfig cfg;
+        cfg.locate = 5;
+        cfg.latency_ns = 50;
+        research::Backtester bt(cfg, 128);
+        std::mt19937_64 rng(0x1234abcdULL);
+        std::uint64_t ts = 1000;
+        for (int i = 0; i < 3000; ++i) {
+            ts += 1 + rng() % 10;
+            const auto type = static_cast<EventType>(rng() % 4);  // Add/Modify/Cancel/Trade
+            const auto id = static_cast<OrderId>(1 + rng() % 100);
+            const auto side = rng() % 2 == 0 ? Side::Buy : Side::Sell;
+            const auto price = static_cast<Price>(90 + rng() % 21);
+            const auto qty = static_cast<Quantity>(1 + rng() % 20);
+            bt.on_event(sym_event(5, type, id, side, price, qty, ts));
+        }
+        return bt.finish();
+    };
+    const auto a = run();
+    const auto b = run();
+    CHECK(a.checksum == b.checksum);
+    CHECK(a.position == b.position && a.cash_ticks == b.cash_ticks && a.trades == b.trades);
+}
+
 // --- M4: hardware cycle timing and thread affinity ---
 
 void test_hardware_timing() {
@@ -1061,6 +1142,9 @@ int main() {
         test_soupbintcp_malformed();
         test_multi_symbol_routing();
         test_l1_features();
+        test_backtest_handworked();
+        test_backtest_latency_delays_fill();
+        test_backtest_determinism();
         test_hardware_timing();
         test_affinity_api();
         test_spsc_concurrently();

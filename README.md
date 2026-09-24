@@ -169,6 +169,20 @@ the honest single-symbol/one-day caveat.
 python3 analysis/signal_validity.py features.csv
 ```
 
+### Backtest loop (Phase 3)
+
+`itch_backtest <file> --locate N --latency-ns L` runs a single-pass, **leak-free**
+event-driven backtest of the imbalance strategy on one symbol, with an explicit
+`feature → decision → arrival` time model (a decision at time `t` enters the sim at
+`t + latency`), a frictionless crossing fill at the opposite touch (the attribution
+ladder's upper bound; the MBO queue model and fees/markout come next), and an
+**integer fixed-point ledger** that flattens at session end. Runs are byte-reproducible
+(a run checksum covers the fill sequence and final state); float analytics stay in Python.
+
+```bash
+./build/itch_backtest data/day.itch --locate 676 --latency-ns 100000 --enter 0.35
+```
+
 ### Latency tooling
 
 `market::cycle_now()` reads the CPU cycle counter (x86 TSC / AArch64 virtual counter,
